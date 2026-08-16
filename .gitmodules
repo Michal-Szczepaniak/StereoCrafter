@@ -1,6 +1,8 @@
 [submodule "dependency/DepthCrafter"]
 	path = dependency/DepthCrafter
-	url = https://github.com/Tencent/DepthCrafter
+	url = https://github.com/Michal-Szczepaniak/DepthCrafter.git
+	branch = stereocrafter-patches
 [submodule "dependency/Forward-Warp"]
 	path = dependency/Forward-Warp
-	url = https://github.com/wbhu/Forward-Warp.git
+	url = https://github.com/Michal-Szczepaniak/Forward-Warp.git
+	branch = stereocrafter-patches
