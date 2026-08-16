@@ -288,6 +288,44 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         frames = frames.float()
         return frames
 
+    def decode_latents_streaming(self, latents, num_frames, decode_chunk_size=1):
+        latents = latents.flatten(0, 1)
+        latents = 1 / self.vae.config.scaling_factor * latents
+
+        forward_vae_fn = (
+            self.vae._orig_mod.forward
+            if is_compiled_module(self.vae)
+            else self.vae.forward
+        )
+
+        accepts_num_frames = (
+            "num_frames"
+            in set(inspect.signature(forward_vae_fn).parameters.keys())
+        )
+
+        for i in range(0, latents.shape[0], decode_chunk_size):
+            latent_chunk = latents[i:i + decode_chunk_size]
+
+            decode_kwargs = {}
+            if accepts_num_frames:
+                decode_kwargs["num_frames"] = latent_chunk.shape[0]
+
+            with torch.inference_mode():
+                decoded = self.vae.decode(
+                    latent_chunk,
+                    **decode_kwargs,
+                ).sample
+
+            # Move decoded pixels off the GPU immediately.
+            decoded = decoded.float().cpu()
+
+            yield decoded
+
+            del decoded
+            del latent_chunk
+
+            torch.cuda.empty_cache()
+
     def check_inputs(self, image, height, width):
         if (
             not isinstance(image, torch.Tensor)
@@ -368,6 +406,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         motion_bucket_id: int = 127,
         noise_aug_strength: int = 0.00,
         decode_chunk_size: Optional[int] = None,
+        vae_encode_chunk_size: Optional[int] = None,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -406,6 +445,12 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
                 The number of frames to decode at a time. The higher the chunk size, the higher the temporal consistency
                 between frames, but also the higher the memory consumption. By default, the decoder will decode all frames at once
                 for maximal quality. Reduce `decode_chunk_size` to reduce memory usage.
+            vae_encode_chunk_size (`int`, *optional*, defaults to 5):
+                The number of input frames to VAE-encode at a time (mirrors decode_chunk_size, but for the encode
+                side). Lower uses less peak VRAM at the cost of more (smaller) VAE calls - matters most for large
+                spatial tiles, where a single 5-frame encode call can itself be the memory bottleneck (VAE
+                activation memory scales with tile pixel count x frames-per-call, and this VAE runs in fp32 -
+                force_upcast=True - doubling that vs fp16).
             num_videos_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
@@ -496,7 +541,10 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
             self.vae.to(dtype=torch.float32)
 
 
-        frame_latents = self._encode_vae_frames(frames, device, num_videos_per_prompt, self.do_classifier_free_guidance)
+        frame_latents = self._encode_vae_frames(
+            frames, device, num_videos_per_prompt, self.do_classifier_free_guidance,
+            n_frames_per_time=vae_encode_chunk_size or 5,
+        )
         frame_latents = frame_latents.to(image_embeddings.dtype)
         
         mask_latents = self._encode_mask_frames(frames_mask,device, num_videos_per_prompt, self.do_classifier_free_guidance)
