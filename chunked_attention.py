@@ -48,7 +48,19 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
+
+try:
+    # torch>=2.3's API for forcing specific SDPA backends.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    def _flash_or_efficient_kernel():
+        return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+except ImportError:
+    # This repo pins torch==2.0.1 (requirements.txt), which predates
+    # torch.nn.attention (added in 2.3) - torch.backends.cuda.sdp_kernel is
+    # the equivalent context manager that version actually has.
+    def _flash_or_efficient_kernel():
+        return torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
 
 
 def chunked_sdpa(query, key, value, attn_mask=None, kv_chunk_size=2048, suppress_probe_warnings=True):
@@ -86,7 +98,7 @@ def chunked_sdpa(query, key, value, attn_mask=None, kv_chunk_size=2048, suppress
             # engaging on different hardware.
             if suppress_probe_warnings:
                 warnings.simplefilter("ignore", UserWarning)
-            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+            with _flash_or_efficient_kernel():
                 return F.scaled_dot_product_attention(
                     query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
                 )

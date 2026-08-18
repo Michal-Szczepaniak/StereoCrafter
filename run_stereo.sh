@@ -13,9 +13,9 @@
 #   NUM_INFERENCE_STEPS=4 ./run_stereo.sh input.mp4
 #
 # For other card sizes, source a preset first (see presets/*.env for what
-# each one assumes and how confident/tested it is - only the 12gb one is
-# actually measured):
-#   source presets/16gb.env && ./run_stereo.sh input.mp4
+# each one assumes and how confident/tested it is - the 12GB and 24GB ones
+# are measured, 16GB is an extrapolation):
+#   source presets/24GB.env && ./run_stereo.sh input.mp4
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
