@@ -44,12 +44,14 @@ no need for the recomputation tricks a real flash-attention kernel needs to
 support training.
 """
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-def chunked_sdpa(query, key, value, attn_mask=None, kv_chunk_size=2048):
+def chunked_sdpa(query, key, value, attn_mask=None, kv_chunk_size=2048, suppress_probe_warnings=True):
     """Drop-in (inference-only) replacement for
     F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask,
     dropout_p=0.0, is_causal=False) - same shapes in, same shape out, O(N)
@@ -74,10 +76,20 @@ def chunked_sdpa(query, key, value, attn_mask=None, kv_chunk_size=2048):
         )
 
     try:
-        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
-            return F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
-            )
+        with warnings.catch_warnings():
+            # PyTorch logs a UserWarning per unavailable backend (flash,
+            # memory-efficient, cuDNN) explaining *why* every time this probe
+            # fails - expected and constant on hardware with no working
+            # kernel (this project's dev GPU always hits this branch), so
+            # suppressed by default. Pass suppress_probe_warnings=False to
+            # see them again, e.g. to confirm the fast path is actually
+            # engaging on different hardware.
+            if suppress_probe_warnings:
+                warnings.simplefilter("ignore", UserWarning)
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+                return F.scaled_dot_product_attention(
+                    query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                )
     except RuntimeError:
         pass  # no working flash/efficient kernel for this shape/hardware - fall through
 
@@ -116,8 +128,9 @@ class MemoryEfficientAttnProcessor:
     chunked_sdpa. Drop in via unet.set_attn_processor(...) - see
     enable_chunked_attention below."""
 
-    def __init__(self, kv_chunk_size=2048):
+    def __init__(self, kv_chunk_size=2048, suppress_probe_warnings=True):
         self.kv_chunk_size = kv_chunk_size
+        self.suppress_probe_warnings = suppress_probe_warnings
 
     def __call__(
         self,
@@ -166,7 +179,11 @@ class MemoryEfficientAttnProcessor:
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        hidden_states = chunked_sdpa(query, key, value, attn_mask=attention_mask, kv_chunk_size=self.kv_chunk_size)
+        hidden_states = chunked_sdpa(
+            query, key, value, attn_mask=attention_mask,
+            kv_chunk_size=self.kv_chunk_size,
+            suppress_probe_warnings=self.suppress_probe_warnings,
+        )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -185,13 +202,16 @@ class MemoryEfficientAttnProcessor:
         return hidden_states
 
 
-def enable_chunked_attention(module, kv_chunk_size=2048):
+def enable_chunked_attention(module, kv_chunk_size=2048, suppress_probe_warnings=True):
     """Replace every attention layer's processor in `module` (a UNet, VAE,
     or any nn.Module with diffusers Attention submodules) with
     MemoryEfficientAttnProcessor. Call this once, right after loading the
     model, before any inference."""
+    processor = MemoryEfficientAttnProcessor(
+        kv_chunk_size=kv_chunk_size, suppress_probe_warnings=suppress_probe_warnings
+    )
     if hasattr(module, "set_attn_processor"):
-        module.set_attn_processor(MemoryEfficientAttnProcessor(kv_chunk_size=kv_chunk_size))
+        module.set_attn_processor(processor)
     else:
         # Fallback for modules without the convenience method (e.g. the VAE
         # in some diffusers versions) - walk submodules and swap any
@@ -200,4 +220,4 @@ def enable_chunked_attention(module, kv_chunk_size=2048):
 
         for submodule in module.modules():
             if isinstance(submodule, Attention):
-                submodule.processor = MemoryEfficientAttnProcessor(kv_chunk_size=kv_chunk_size)
+                submodule.processor = processor

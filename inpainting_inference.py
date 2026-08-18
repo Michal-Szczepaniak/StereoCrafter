@@ -3,6 +3,7 @@ import gc
 import json
 import shutil
 import subprocess
+import sys
 import time
 import cv2
 import numpy as np
@@ -25,6 +26,60 @@ def _format_duration(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
+class LiveProgress:
+    """One continuously-updating status line covering both levels of
+    progress this stage has (outer chunk/ETA, and the per-tile denoising
+    step) instead of three separate noisy streams - the outer "Process:
+    i/N" print, per-tile "TILE [i,j]" prints, and diffusers' own per-tile
+    tqdm bar (0/8, restarting for every one of tile_num^2 tiles). Redraws
+    in place via \\r; only commits a real newline once per outer chunk
+    (set_header), so nothing scrolls except one line per chunk."""
+
+    def __init__(self, num_frames: int, total_iters: int):
+        self.num_frames = num_frames
+        self.total_iters = total_iters
+        self._header = ""
+        self._tile_idx = 0
+        self._tile_total = 0
+        self._tile_pos = ""
+        self._step = 0
+        self._num_steps = 0
+        self._last_len = 0
+
+    def set_header(self, i, iter_index, overlap, cur_i, cur_overlap, timing_str):
+        self._header = (
+            f"Process: {i}/{self.num_frames} (chunk {iter_index}/{self.total_iters}), "
+            f"overlap {overlap}, cur_i {cur_i} cur_overlap {cur_overlap}{timing_str}"
+        )
+        self._tile_idx = self._tile_total = self._step = self._num_steps = 0
+        self._render()
+
+    def set_tile(self, tile_idx: int, tile_total: int, i: int, j: int):
+        self._tile_idx, self._tile_total = tile_idx, tile_total
+        self._tile_pos = f"[{i},{j}]"
+        self._step = self._num_steps = 0
+        self._render()
+
+    def set_step(self, step: int, num_steps: int):
+        self._step, self._num_steps = step, num_steps
+        self._render()
+
+    def _render(self):
+        line = self._header
+        if self._tile_total:
+            line += f" | tile {self._tile_idx}/{self._tile_total} {self._tile_pos}"
+            if self._num_steps:
+                line += f" | step {self._step}/{self._num_steps}"
+        pad = max(self._last_len - len(line), 0)
+        sys.stdout.write("\r" + line + " " * pad)
+        sys.stdout.flush()
+        self._last_len = len(line)
+
+    def finish_iter(self):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def _round_up_to_multiple(x: int, multiple: int = 64) -> int:
@@ -65,6 +120,7 @@ def spatial_tiled_process(
     process_func,
     tile_num,
     spatial_n_compress=8,
+    progress: "LiveProgress | None" = None,
     **kargs,
 ):
     height = cond_frames.shape[2]
@@ -97,6 +153,22 @@ def spatial_tiled_process(
         tile_size[1] - tile_overlap[1],
     )
 
+    # Feeds per-step updates into the single shared status line instead of
+    # diffusers' own per-tile tqdm bar (a fresh 0/num_inference_steps bar
+    # for every one of tile_num^2 tiles otherwise). One callback instance
+    # reused across tiles - it only reports *which step*, not *which
+    # tile*, since progress.set_tile() below already tracks that.
+    if progress is not None:
+        num_steps_for_progress = kargs.get("num_inference_steps")
+
+        def _progress_step_callback(pipe, step, timestep, callback_kwargs):
+            progress.set_step(step + 1, num_steps_for_progress)
+            return callback_kwargs
+
+        kargs = dict(kargs, callback_on_step_end=_progress_step_callback)
+
+    tile_total = tile_num * tile_num
+    tile_counter = 0
     cols = []
     for i in range(0, tile_num):
         rows = []
@@ -112,12 +184,16 @@ def spatial_tiled_process(
                 j * tile_stride[1] : j * tile_stride[1] + tile_size[1],
             ]
 
-            print(
-                f"TILE [{i},{j}]: "
-                f"shape={tuple(cond_tile.shape)}, "
-                f"H={cond_tile.shape[2]}, "
-                f"W={cond_tile.shape[3]}"
-            )
+            tile_counter += 1
+            if progress is not None:
+                progress.set_tile(tile_counter, tile_total, i, j)
+            else:
+                print(
+                    f"TILE [{i},{j}]: "
+                    f"shape={tuple(cond_tile.shape)}, "
+                    f"H={cond_tile.shape[2]}, "
+                    f"W={cond_tile.shape[3]}"
+                )
             tile = process_func(
                 frames=cond_tile,
                 frames_mask=mask_tile,
@@ -229,23 +305,55 @@ class FFmpegSegmentWriter:
             raise RuntimeError(f"ffmpeg exited with code {ret} while writing {self.path}")
 
 
-def _concat_segments(segment_paths, output_path):
-    """Losslessly stitch segments (all encoded with identical settings by
-    FFmpegSegmentWriter) into a single output file via ffmpeg's concat
-    demuxer + stream copy - no re-encode, no further quality loss."""
-    list_path = output_path + ".concat_list.txt"
-    with open(list_path, "w") as f:
-        for p in segment_paths:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", list_path,
-            "-c", "copy", output_path,
-        ],
-        check=True,
-    )
-    os.remove(list_path)
+def _concat_segments(segment_paths, output_path, fps, width, height):
+    """Stitch segments (all encoded with identical settings by
+    FFmpegSegmentWriter) into a single output file.
+
+    NOT ffmpeg's concat demuxer + stream copy (`-f concat -safe 0 -i list.txt
+    -c copy`) - that spliced compressed bitstreams from ~300 independently
+    keyframed tiny segments (2-5 frames each) and produced a genuinely
+    invalid file: verified via `ffmpeg -i right.mkv -vsync 0 out_%04d.png`
+    logging "non monotonically increasing dts to muxer" at 7 evenly-spaced
+    points in a real 604-frame/301-segment run. That's not cosmetic -
+    different decode paths handled the corruption differently (some
+    silently dropped or reordered a frame right at that point, some didn't),
+    which was the actual root cause of a user-reported permanent one-frame
+    skew between the two eyes from that point in the video onward (traced
+    all the way back from the final SBS output, through hstack/hstack-only
+    raw-pixel combines, to this file itself - stage 1's warp/mask output
+    was verified frame-for-frame correct throughout, so the corruption is
+    introduced here).
+
+    Instead: decode every segment to raw RGB (no compressed bitstream, no
+    per-segment GOP/keyframe structure, nothing for a timestamp to get
+    wrong) and pipe the concatenated byte stream through a single fresh
+    encode - same principle as FFmpegSegmentWriter's own raw-pixel writing,
+    just applied once more at the joining step instead of trusting container
+    timestamps to survive a compressed-stream splice.
+    """
+    writer_cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+        "-pix_fmt", "yuv420p",
+        "-f", "matroska",
+        output_path,
+    ]
+    writer = subprocess.Popen(writer_cmd, stdin=subprocess.PIPE)
+    for seg_path in segment_paths:
+        reader = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-i", seg_path,
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            stdout=subprocess.PIPE, check=True,
+        )
+        writer.stdin.write(reader.stdout)
+    writer.stdin.close()
+    ret = writer.wait()
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg exited with code {ret} while concatenating segments into {output_path}")
 
 
 def main(
@@ -272,6 +380,7 @@ def main(
     resume=True,
     chunked_attention=True,
     attention_kv_chunk_size=1024,
+    suppress_attention_kernel_warnings=True,
 ):
     """NOTE: --input_video_path is now --splat_store_dir - point it at the
     directory depth_splatting_inference.py wrote (warp.npy + mask.npy +
@@ -307,6 +416,12 @@ def main(
     (O(seq_len) memory, some compute overhead) - lets tile_num go lower
     (bigger tiles, fewer of them) on any card. attention_kv_chunk_size
     trades memory for speed: smaller = less VRAM, more (smaller) matmuls.
+    suppress_attention_kernel_warnings: chunked_attention always probes for
+    a real flash/efficient kernel first (see chunked_attention.py) - on
+    hardware where that probe always fails (this GPU), PyTorch logs a
+    UserWarning per unavailable backend on every single call, which spams
+    the LiveProgress status line. On by default; set False to see them
+    again (e.g. to confirm the fast path is engaging on different hardware).
     """
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         pre_trained_path, subfolder="image_encoder", variant="fp16", torch_dtype=torch.float16
@@ -330,6 +445,12 @@ def main(
         torch_dtype=torch.float16,
     )
 
+    # diffusers' own per-call tqdm bar would otherwise print a fresh
+    # 0/num_inference_steps bar for every one of tile_num^2 tiles - replaced
+    # by LiveProgress's single status line (fed via callback_on_step_end,
+    # see spatial_tiled_process) instead.
+    pipeline.set_progress_bar_config(disable=True)
+
     # OPTIMIZATION (VRAM): these are cheap opt-ins if you're still tight on GPU
     # memory after the RAM fix below. cpu offload trades speed for VRAM.
     if enable_sequential_cpu_offload:
@@ -343,8 +464,14 @@ def main(
     if enable_vae_tiling and hasattr(pipeline.vae, "enable_tiling"):
         pipeline.vae.enable_tiling()
     if chunked_attention:
-        enable_chunked_attention(pipeline.unet, kv_chunk_size=attention_kv_chunk_size)
-        enable_chunked_attention(pipeline.vae, kv_chunk_size=attention_kv_chunk_size)
+        enable_chunked_attention(
+            pipeline.unet, kv_chunk_size=attention_kv_chunk_size,
+            suppress_probe_warnings=suppress_attention_kernel_warnings,
+        )
+        enable_chunked_attention(
+            pipeline.vae, kv_chunk_size=attention_kv_chunk_size,
+            suppress_probe_warnings=suppress_attention_kernel_warnings,
+        )
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -477,6 +604,7 @@ def main(
     iter_durations = []
     iter_start = None
     completed = False
+    progress = LiveProgress(num_frames, total_iters)
     with torch.inference_mode():  # OPTIMIZATION: skip autograd bookkeeping entirely
         i = next_i
         while True:
@@ -510,10 +638,7 @@ def main(
                 )
             else:
                 timing_str = ""
-            print(
-                f"Process: {i}/{num_frames} (chunk {iter_index}/{total_iters}), "
-                f"overlap {overlap}, cur_i {cur_i} cur_overlap {cur_overlap}{timing_str}"
-            )
+            progress.set_header(i, iter_index, overlap, cur_i, cur_overlap, timing_str)
 
             if generated is not None:
                 try:
@@ -531,6 +656,7 @@ def main(
                 pipeline,
                 tile_num,
                 spatial_n_compress=8,
+                progress=progress,
                 min_guidance_scale=min_guidance_scale,
                 max_guidance_scale=max_guidance_scale,
                 decode_chunk_size=decode_chunk_size,
@@ -634,6 +760,7 @@ def main(
             next_i = i
             torch.save(generated, tail_path)
             save_checkpoint()
+            progress.finish_iter()
 
             if max_iters is not None and iter_index >= max_iters:
                 print(f"==> Stopping early: reached max_iters={max_iters}")
@@ -648,7 +775,7 @@ def main(
 
     right_eye_path = os.path.join(save_dir, f"{video_name}_right.mkv")
     segment_paths = [os.path.join(checkpoint_dir, s) for s in segments]
-    _concat_segments(segment_paths, right_eye_path)
+    _concat_segments(segment_paths, right_eye_path, fps, width, height)
     shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     print(f"\n==> Right-eye video written to: {right_eye_path}")
@@ -657,19 +784,48 @@ def main(
     if src:
         sbs_out = os.path.join(save_dir, f"{video_name}_sbs.mkv")
         anaglyph_out = os.path.join(save_dir, f"{video_name}_anaglyph.mp4")
-        # Both `fps=` filters below use the *same* fps value, so ffmpeg parses
-        # it into the same internal rational for both streams. Without this,
-        # each input keeps its own file's stored timebase (e.g. source
-        # 24000/1001 vs right_eye_path's mkv-muxer-imposed 1/1000 - the
-        # matroska muxer can't be told to use a finer timescale, verified
-        # empirically), and hstack/anaglyph's PTS-based frame sync then
-        # intermittently holds one side for an extra output frame while it
-        # "waits" for the other - an alternating single-eye freeze every few
-        # frames, not a smooth drift. Forcing an identical explicit rate on
-        # both sides before combining removes the ambiguity entirely, even
-        # when stride == 1 (verified: a synthetic exact-timebase-mp4 +
-        # jittery-timebase-mkv pair through this same filter came out
-        # frame-exact, zero drops/dupes).
+        # RIGHT always goes through `setpts=N/({fps}*TB)`, never `fps={fps}`.
+        # Matroska's muxer can't represent a timescale finer than 1ms
+        # (verified empirically, -video_track_timescale/-enc_time_base are
+        # no-ops for it), and for 29.97fps (period 1001/30000s = 33.3667ms)
+        # that 1ms grid always rounds down to 33ms - not harmless +-0.5ms
+        # jitter, but a consistent ~0.367ms/frame bias that compounds across
+        # every chunk FFmpegSegmentWriter/_concat_segments writes and joins.
+        # Confirmed on an actual 604-frame/301-chunk run: right.mkv's own
+        # frame PTS drifted to -220ms (6.6 frames) by the last frame, despite
+        # the decoded frame count matching the source exactly (a timestamp
+        # bug, not a dropped/duplicated-content bug). Since chunking already
+        # guarantees right.mkv has exactly one frame per source frame in
+        # order (verified via -count_frames AND by extracting and visually
+        # diffing frames straddling an actual scene cut), its presentation
+        # timing can be rebuilt from scratch by frame index instead (N =
+        # 0-based frame counter, TB = this stream's own timebase) - the
+        # drifted input PTS setpts reads are irrelevant to what it writes,
+        # so the accumulated bias can't carry through.
+        #
+        # LEFT uses the *same* setpts treatment whenever stride == 1 (no
+        # real up/downsampling needed - verified frame-for-frame parity with
+        # right, see above) - NOT `fps={fps}`, even though the source file's
+        # own timebase doesn't suffer the mkv-quantization problem above.
+        # Mixing a PTS-driven filter (fps=, which snaps to nearest output
+        # tick and can therefore select frame N on one side vs N+-1 on the
+        # other right at a boundary) on one side with an index-driven filter
+        # (setpts) on the other reintroduced a 1-frame skew exactly at hard
+        # cuts even after fixing right's own drift above - confirmed by
+        # pulling a frame straddling a real cut from the combined output and
+        # seeing left still on the old scene while right had already cut.
+        # Two filters with different selection logic simply don't agree on
+        # exactly which input frame lands in which output slot near a
+        # boundary, even when both are fed frame-accurate input. Making both
+        # sides index-driven removes the ambiguity instead of trying to keep
+        # both filters' rounding in sync.
+        #
+        # stride > 1 (target_fps < source fps) is the one case that still
+        # needs `fps={fps}` on LEFT: right.mkv only has one frame per
+        # *sampled* source frame, so left genuinely needs real frames
+        # dropped, not just relabeled - see the NOTE below.
+        stride = meta.get("stride", 1)
+        left_time_filter = f"fps={fps}" if stride != 1 else f"setpts=N/({fps}*TB)"
         # setsar=2/1 doubles the reported DAR (e.g. 32:9 -> 64:9 for a
         # 3840x1080 frame) via the H.264 VUI's sample aspect ratio - a
         # secondary hint some players use. The signal that actually matters
@@ -683,25 +839,25 @@ def main(
         print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible):")
         print(
             f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
-            f'"[0:v]fps={fps},crop={width}:{height}:0:0[left];'
-            f'[1:v]fps={fps}[right];[left][right]hstack,setsar=2/1" '
+            f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
+            f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1" '
             f'-c:v libx264 -pix_fmt yuv420p -crf 18 '
             f'-metadata:s:v:0 stereo_mode=left_right "{sbs_out}"'
         )
         print("\n==> Or into red/cyan anaglyph (ffmpeg has a built-in filter for this):")
         print(
             f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
-            f'"[0:v]fps={fps},crop={width}:{height}:0:0[left];'
-            f'[1:v]fps={fps}[right];[left][right]anaglyph=rc" '
+            f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
+            f'[1:v]setpts=N/({fps}*TB)[right];[left][right]anaglyph=rc" '
             f'-c:v libx264 -crf 18 "{anaglyph_out}"'
         )
-        if meta.get("stride", 1) != 1:
+        if stride != 1:
             print(
-                f"\n    NOTE: this run used stride={meta['stride']} (target_fps < source fps), "
+                f"\n    NOTE: this run used stride={stride} (target_fps < source fps), "
                 f"so the original video runs at a different frame rate than the right-eye "
-                f"output. Add `-vf fps={fps}` on the original's input (or -r {fps} on output) "
-                f"to the command above so frames line up 1:1 - straight hstack/anaglyph will "
-                f"otherwise drift out of sync over the length of the clip."
+                f"output - the command above already accounts for this (LEFT uses `fps={fps}` "
+                f"to actually drop frames down to the sampled rate; RIGHT uses setpts since it "
+                f"has no extra frames to drop)."
             )
 
 

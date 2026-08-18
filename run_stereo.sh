@@ -91,6 +91,11 @@ MAX_ITERS="${MAX_ITERS:-}"
 CHUNKED_ATTENTION="${CHUNKED_ATTENTION:-True}"
 ATTENTION_KV_CHUNK_SIZE="${ATTENTION_KV_CHUNK_SIZE:-1024}"
 VAE_ENCODE_CHUNK_SIZE="${VAE_ENCODE_CHUNK_SIZE:-5}"
+# chunked_attention's fast-kernel probe logs a UserWarning per unavailable
+# backend every time it fails (constant on hardware with no working kernel)
+# - suppressed by default since it spams the live progress line. Set False
+# to see them again.
+SUPPRESS_ATTENTION_KERNEL_WARNINGS="${SUPPRESS_ATTENTION_KERNEL_WARNINGS:-True}"
 
 # ---- resumability: both stages checkpoint every chunk to disk (depth
 # chunks + carry_latents / .mkv segments + generated tail, respectively -
@@ -164,6 +169,7 @@ stage2_run() {
         --num_inference_steps "$NUM_INFERENCE_STEPS" \
         --chunked_attention="$CHUNKED_ATTENTION" \
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \
+        --suppress_attention_kernel_warnings="$SUPPRESS_ATTENTION_KERNEL_WARNINGS" \
         --vae_encode_chunk_size="$VAE_ENCODE_CHUNK_SIZE" \
         --resume="$RESUME" \
         "${MAX_ITERS_ARG[@]}" \

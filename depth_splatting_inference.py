@@ -17,7 +17,41 @@ from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTempora
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 
 from Forward_Warp import forward_warp
-from splat_store import create_store, write_meta
+from splat_store import create_store, open_store, write_meta
+
+
+def _store_is_complete(store_dir, expected_params):
+    """True if store_dir already holds a finished warp/mask store matching
+    expected_params exactly - i.e. this exact stage-1 invocation has nothing
+    left to do.
+
+    Checked BEFORE constructing DepthCrafterDemo (model load) or calling
+    infer() at all, specifically so that resuming a pipeline where stage 1
+    already finished (but stage 2 got interrupted) skips straight past
+    stage 1 instead of redoing the whole multi-hour depth pass from frame 0 -
+    infer()'s own checkpoint only covers a mid-depth-pass crash, and is
+    deleted the moment stage 1 finishes successfully (see main()), so a
+    completed run leaves nothing for infer() itself to resume from.
+
+    Requires the depth checkpoint dir to be ABSENT: main() only removes it
+    after splatting (which has no resume of its own) also completes, so its
+    presence means the prior run was interrupted, not finished - falling
+    through to the normal (slower, but safe) checkpoint/resume path.
+    """
+    checkpoint_dir = os.path.join(store_dir, ".depth_checkpoint")
+    if os.path.exists(checkpoint_dir):
+        return False
+    try:
+        warp, mask, meta = open_store(store_dir, mode="r")
+    except (FileNotFoundError, ValueError):
+        return False
+    if meta.get("params") != expected_params:
+        return False
+    num_frames, height, width = meta.get("num_frames"), meta.get("height"), meta.get("width")
+    return (
+        warp.shape == (num_frames, height, width, 3)
+        and mask.shape == (num_frames, height, width)
+    )
 
 
 def get_video_info(video_path, max_res, target_fps=-1, dataset="open"):
@@ -463,6 +497,7 @@ def DepthSplatting(
     stride,
     original_height,
     original_width,
+    store_params=None,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -509,6 +544,7 @@ def DepthSplatting(
         height=height,
         width=width,
         source_video_path=os.path.abspath(input_video_path),
+        params=store_params,
     )
     print(f"==> writing splat store to: {store_dir}")
     print(f"==> ({num_frames} x {height} x {width}) warp uint8 + mask uint8, no grid, no depth-vis")
@@ -639,7 +675,30 @@ def main(
     also completes successfully - if splatting fails, rerunning this same
     command skips straight back to splatting instead of redoing the depth
     pass. Set resume=False to force a clean restart.
+
+    Also: if output_dir already holds a *complete* store for these exact
+    params (stage 1 finished on a previous run, e.g. while stage 2 got
+    interrupted and the whole pipeline was rerun from the top), this returns
+    immediately without loading the model or touching the GPU at all -
+    infer()'s own checkpoint can't cover this case since it's deleted the
+    moment stage 1 finishes (see _store_is_complete's docstring).
     """
+    store_params = {
+        "input_video_path": os.path.abspath(input_video_path),
+        "max_disp": max_disp,
+        "process_length": process_length,
+        "max_res": max_res,
+        "chunk_size": chunk_size,
+        "window_size": window_size,
+        "window_overlap": window_overlap,
+        "target_fps": target_fps,
+        "num_denoising_steps": num_denoising_steps,
+        "guidance_scale": guidance_scale,
+    }
+    if resume and _store_is_complete(output_dir, store_params):
+        print(f"==> Stage 1 already complete for these params - reusing existing store at {output_dir}")
+        return
+
     depthcrafter_demo = DepthCrafterDemo(
         unet_path=unet_path,
         pre_trained_path=pre_trained_path,
@@ -684,6 +743,7 @@ def main(
             stride,
             original_height,
             original_width,
+            store_params=store_params,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")
