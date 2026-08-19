@@ -7,7 +7,12 @@
 #
 # Usage:
 #   ./watch_vram.sh [interval_seconds] [logfile]
-# Defaults: 10s interval, ./vram_watch.log
+# Defaults: 0.1s (100ms) interval, ./vram_watch.log - note each nvidia-smi
+# call itself takes some tens of ms, so actual cadence runs a bit slower
+# than the nominal interval, and at this rate the CSV grows fast (~10
+# lines/sec - hours of unattended logging means a genuinely large file,
+# worth trimming/rotating or lowering the rate once you've confirmed VRAM
+# is flat and just want a low-overhead background check).
 #
 # Run it detached so it survives you disconnecting (tmux/screen, or):
 #   nohup ./watch_vram.sh 10 vram_watch.log > /dev/null 2>&1 &
@@ -17,7 +22,7 @@
 #   grep WARNING vram_watch.log                     # did it ever cross the threshold
 set -euo pipefail
 
-INTERVAL="${1:-10}"
+INTERVAL="${1:-0.1}"
 LOGFILE="${2:-vram_watch.log}"
 WARN_PCT="${WARN_PCT:-95}"   # log a WARNING line once usage crosses this % of total
 
