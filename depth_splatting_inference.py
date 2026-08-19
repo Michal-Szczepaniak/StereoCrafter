@@ -629,6 +629,19 @@ def DepthSplatting(
         frame_offset += chunk_frames
         del depth_chunk
 
+        # Free this chunk's depth file now that it's safely flushed into
+        # warp_store/mask_store - depth (float32, 1ch) and warp+mask
+        # (uint8, 3ch+1ch) are ~the same bytes/pixel, so without this,
+        # PASS 2 needs a second full copy of the store's total size on top
+        # of the still-undeleted depth checkpoint (main() only removes
+        # checkpoint_dir after this whole function returns) - on a
+        # multi-hundred-GB episode that's an ENOSPC guarantee, not a risk.
+        # Tradeoff: a PASS-2 failure for a *non*-disk reason after this
+        # point can no longer redo splatting from chunk 0 (this chunk's
+        # depth file is gone) - accepted since the alternative (no delete)
+        # fails every time anyway.
+        os.remove(chunk_path)
+
     warp_store.flush()
     mask_store.flush()
 
