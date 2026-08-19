@@ -600,7 +600,11 @@ def main(
     # estimate, not an exact countdown.
     step = max(frames_chunk - overlap, 1)
     total_iters = max((num_frames - overlap + step - 1) // step, 1)
-    iter_index = 0
+    # Resuming from a checkpoint skips straight to frame `next_i`, but the
+    # chunks that got it there still count toward total_iters - start the
+    # counter at len(segments) so the displayed "chunk N/total" and the ETA's
+    # remaining_iters both reflect chunks actually left, not the whole run.
+    iter_index = len(segments)
     iter_durations = []
     iter_start = None
     completed = False
