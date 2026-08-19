@@ -66,6 +66,13 @@ WINDOW_OVERLAP="${WINDOW_OVERLAP:-25}"
 # a tight card since stage 1 checkpoints every chunk (see RESUME below) - an
 # OOM only loses the in-flight chunk.
 CPU_OFFLOAD="${CPU_OFFLOAD:-None}"
+# FFV1-compressed splat store instead of raw .npy - MEASURED ~6.9x smaller
+# on a real 240-frame local store (1920x1080, anime source), verified
+# bit-exact round-trip (see splat_store.py's module docstring for the full
+# writeup and why plain H.264 was rejected). Decode cost is negligible next
+# to stage 2's per-iteration diffusion cost. Set False to fall back to the
+# original uncompressed format.
+COMPRESS_STORE="${COMPRESS_STORE:-True}"
 
 # ---- stage 2 (inpainting) knobs - these fit a 12GB card at 1080p; going
 # below tile_num=4, or disabling cpu offload, or raising decode_chunk_size
@@ -136,7 +143,8 @@ stage1_run() {
         --window_size="$WINDOW_SIZE" \
         --window_overlap="$WINDOW_OVERLAP" \
         --cpu_offload="$CPU_OFFLOAD" \
-        --resume="$RESUME"
+        --resume="$RESUME" \
+        --compress_store="$COMPRESS_STORE"
 }
 
 echo "==================================================================="

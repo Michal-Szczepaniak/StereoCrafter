@@ -554,13 +554,20 @@ def DepthSplatting(
     original_height,
     original_width,
     store_params=None,
+    compress_store=True,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
-    (right-eye) image and the occlusion mask - to a pair of memory-mapped
-    .npy files under `store_dir` (see splat_store.py). "left" is not
-    duplicated here at all; the inpaint stage reads it straight from
-    `input_video_path`.
+    (right-eye) image and the occlusion mask - under `store_dir` (see
+    splat_store.py). "left" is not duplicated here at all; the inpaint
+    stage reads it straight from `input_video_path`.
+
+    compress_store (default True): FFV1-compressed store instead of raw
+    .npy - measured ~7x smaller on real content with a verified bit-exact
+    round-trip, at a CPU decode cost stage 2 never notices (see
+    splat_store.py's module docstring for the numbers and why plain H.264
+    was rejected). Set False to fall back to the original uncompressed
+    format if you ever need to debug/compare against it directly.
 
     FIX (carried over): depth chunk index i was computed from source video
     frame i*stride (DepthCrafter runs on a temporally-subsampled clip
@@ -591,7 +598,7 @@ def DepthSplatting(
             f"the resolution depth was computed/resized at {(original_height, original_width)}"
         )
 
-    warp_store, mask_store = create_store(store_dir, num_frames, height, width)
+    warp_store, mask_store = create_store(store_dir, num_frames, height, width, compress=compress_store)
     write_meta(
         store_dir,
         fps=target_fps,
@@ -722,6 +729,12 @@ def DepthSplatting(
 
     warp_store.flush()
     mask_store.flush()
+    # Compressed writer: final flush + write the group index (no-op for the
+    # raw memmap format, which has no .close()).
+    if hasattr(warp_store, "close"):
+        warp_store.close()
+    if hasattr(mask_store, "close"):
+        mask_store.close()
 
     print("==> Depth splatting complete.")
     print(f"==> wrote: {store_dir}")
@@ -747,10 +760,12 @@ def main(
     num_denoising_steps: int = 8,
     guidance_scale: float = 1.0,
     resume: bool = True,
+    compress_store: bool = True,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
-    writes an mp4, it writes a directory (warp.npy + mask.npy + meta.json).
-    Point inpainting_inference.py's --splat_store_dir at this directory.
+    writes an mp4, it writes a directory (splat_store.py's format -
+    FFV1-compressed by default, see compress_store) - point
+    inpainting_inference.py's --splat_store_dir at this directory.
 
     chunk_overlap is now ignored (kept only so old scripts/env vars don't
     break) - cross-chunk continuity uses window_overlap for both the
@@ -835,6 +850,7 @@ def main(
             original_height,
             original_width,
             store_params=store_params,
+            compress_store=compress_store,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")
