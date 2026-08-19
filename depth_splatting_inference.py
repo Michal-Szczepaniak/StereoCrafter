@@ -2,6 +2,8 @@ import gc
 import json
 import os
 import shutil
+import sys
+import time
 from typing import Optional
 import numpy as np
 import torch
@@ -18,6 +20,60 @@ from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 
 from Forward_Warp import forward_warp
 from splat_store import create_store, open_store, write_meta
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
+class LiveProgress:
+    """One continuously-updating status line covering both levels of
+    progress this pass has (outer depth-chunk/ETA, and the per-batch warp
+    call within it) instead of two separate noisy print streams - the
+    outer "Splatting chunk i/N" print and one line per batch. Redraws in
+    place via \\r; only commits a real newline once per outer chunk
+    (finish_chunk), so nothing scrolls except one line per chunk.
+
+    1:1 port of inpainting_inference.py's LiveProgress (same header/ETA
+    mechanics) - the only difference is the sub-level: splatting has no
+    per-tile denoising steps, so the sub-level here is the per-batch warp
+    call instead of tile/step."""
+
+    def __init__(self, num_frames: int, total_chunks: int):
+        self.num_frames = num_frames
+        self.total_chunks = total_chunks
+        self._header = ""
+        self._batch_idx = 0
+        self._batch_total = 0
+        self._last_len = 0
+
+    def set_header(self, frame_offset, chunk_index, chunk_frames, timing_str):
+        self._header = (
+            f"Splatting: {frame_offset}/{self.num_frames} "
+            f"(chunk {chunk_index}/{self.total_chunks}, {chunk_frames} frames){timing_str}"
+        )
+        self._batch_idx = self._batch_total = 0
+        self._render()
+
+    def set_batch(self, batch_idx: int, batch_total: int):
+        self._batch_idx, self._batch_total = batch_idx, batch_total
+        self._render()
+
+    def _render(self):
+        line = self._header
+        if self._batch_total:
+            line += f" | batch {self._batch_idx}/{self._batch_total}"
+        pad = max(self._last_len - len(line), 0)
+        sys.stdout.write("\r" + line + " " * pad)
+        sys.stdout.flush()
+        self._last_len = len(line)
+
+    def finish_chunk(self):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def _store_is_complete(store_dir, expected_params):
@@ -553,18 +609,39 @@ def DepthSplatting(
 
     frame_offset = 0
 
+    # OPTIMIZATION: rolling average of per-chunk wall time, just to print an
+    # ETA - the last chunk's frame count can differ (see chunk_frames
+    # clamping below), so this is an estimate, not an exact countdown.
+    chunk_durations = []
+    chunk_start = None
+    progress = LiveProgress(num_frames, len(chunk_files))
+
     for chunk_index, chunk_path in enumerate(chunk_files):
         depth_chunk = np.load(chunk_path, mmap_mode="r")
         chunk_frames = min(depth_chunk.shape[0], num_frames - frame_offset)
         if chunk_frames <= 0:
             break
 
-        print(
-            f"\n==> Splatting chunk {chunk_index + 1}/{len(chunk_files)} "
-            f"frames {frame_offset}:{frame_offset + chunk_frames}"
-        )
+        if chunk_start is not None:
+            chunk_durations.append(time.monotonic() - chunk_start)
+        chunk_start = time.monotonic()
 
+        if chunk_durations:
+            avg_chunk_time = sum(chunk_durations) / len(chunk_durations)
+            last_chunk_time = chunk_durations[-1]
+            remaining_chunks = max(len(chunk_files) - chunk_index, 0)
+            eta = _format_duration(avg_chunk_time * remaining_chunks)
+            timing_str = (
+                f", last_chunk {last_chunk_time:.1f}s, avg_chunk {avg_chunk_time:.1f}s, "
+                f"ETA {eta}"
+            )
+        else:
+            timing_str = ""
+        progress.set_header(frame_offset, chunk_index + 1, chunk_frames, timing_str)
+
+        total_batches = (chunk_frames + batch_size - 1) // batch_size
         for i in range(0, chunk_frames, batch_size):
+            progress.set_batch(i // batch_size + 1, total_batches)
             end = min(i + batch_size, chunk_frames)
 
             sample_start = frame_offset + i
@@ -641,6 +718,7 @@ def DepthSplatting(
         # depth file is gone) - accepted since the alternative (no delete)
         # fails every time anyway.
         os.remove(chunk_path)
+        progress.finish_chunk()
 
     warp_store.flush()
     mask_store.flush()
