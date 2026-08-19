@@ -81,6 +81,21 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 TILE_NUM="${TILE_NUM:-4}"
 FRAMES_CHUNK="${FRAMES_CHUNK:-5}"
 OVERLAP="${OVERLAP:-3}"
+# Was unconditionally True regardless of card size - PROFILED this session
+# (real cProfile run on the local 12GB card): the offload hooks' per-call
+# CPU<->GPU reshuffling cost ~15%+ of stage-2 wall time (chained
+# image_encoder->unet->vae, each stage onloaded/offloaded on every single
+# tile pass, not once per run - see the chunk loop's manual `pipeline.vae
+# .to("cpu")` a bit further down for why that chaining is deliberate, not a
+# bug). Only worth turning off on a card with real VRAM headroom to spare -
+# NOT the current rental config: the FRAMES_CHUNK=30 tuning in this same
+# preset file measured peak VRAM at ~22.6-23.2GB out of ~24.5GB WITH
+# cpu_offload on, i.e. as little as ~1.3GB headroom - flipping this off on
+# that config would likely OOM. Left at True (unchanged default) here;
+# this is a lever for a *future* run where you've independently confirmed
+# there's real headroom to give up cpu_offload's savings for speed, not a
+# switch to flip on whatever's currently running.
+ENABLE_MODEL_CPU_OFFLOAD="${ENABLE_MODEL_CPU_OFFLOAD:-True}"
 DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-1}"
 DECODE_LATENTS_CHUNK_SIZE="${DECODE_LATENTS_CHUNK_SIZE:-1}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-8}"
@@ -173,7 +188,7 @@ stage2_run() {
         --overlap "$OVERLAP" \
         --decode_chunk_size "$DECODE_CHUNK_SIZE" \
         --decode_latents_chunk_size "$DECODE_LATENTS_CHUNK_SIZE" \
-        --enable_model_cpu_offload=True \
+        --enable_model_cpu_offload="$ENABLE_MODEL_CPU_OFFLOAD" \
         --num_inference_steps "$NUM_INFERENCE_STEPS" \
         --chunked_attention="$CHUNKED_ATTENTION" \
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \
