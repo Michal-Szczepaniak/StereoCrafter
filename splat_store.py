@@ -90,9 +90,16 @@ MASK_PREFIX = "mask"
 _FFV1_CACHE_GROUPS = 2  # decoded groups kept resident - see module docstring
 
 
-def _ffv1_encode(frames, out_path, pix_fmt, width, height):
-    """frames: contiguous np.uint8 array, shape (n, H, W[, C]) matching
-    pix_fmt (rgb24 = 3ch, gray = 1ch/no trailing dim)."""
+def ffv1_encode(frames, out_path, pix_fmt, width, height):
+    """frames: contiguous np.uint8/np.uint16 array (dtype must match
+    pix_fmt's bit depth), shape (n, H, W[, C]) matching pix_fmt (rgb24 =
+    3ch uint8, gray = 1ch/no trailing dim uint8, gray16le = 1ch uint16 -
+    used for quantized depth, see depth_splatting_inference.py).
+
+    Shared by splat_store.py (warp/mask) and depth_splatting_inference.py
+    (quantized depth checkpoint) - not splat-store-specific despite living
+    in this module, kept here just to have one FFV1 subprocess
+    implementation instead of two."""
     frames = np.ascontiguousarray(frames)
     proc = subprocess.Popen(
         [
@@ -112,7 +119,7 @@ def _ffv1_encode(frames, out_path, pix_fmt, width, height):
         raise RuntimeError(f"ffmpeg FFV1 encode failed (exit {ret}) for {out_path}")
 
 
-def _ffv1_decode(path, pix_fmt, width, height, channels):
+def ffv1_decode(path, pix_fmt, width, height, channels, dtype=np.uint8):
     proc = subprocess.run(
         [
             "ffmpeg", "-loglevel", "error",
@@ -123,7 +130,7 @@ def _ffv1_decode(path, pix_fmt, width, height, channels):
         stdout=subprocess.PIPE,
         check=True,
     )
-    arr = np.frombuffer(proc.stdout, dtype=np.uint8)
+    arr = np.frombuffer(proc.stdout, dtype=dtype)
     shape = (-1, height, width, channels) if channels else (-1, height, width)
     return arr.reshape(shape)
 
@@ -165,7 +172,7 @@ class _CompressedWriter:
         group_start = self._next_frame - n
         filename = f"{self._prefix}_{self._group_index:06d}.mkv"
         out_path = os.path.join(self._store_dir, filename)
-        _ffv1_encode(data, out_path, self._pix_fmt, self._width, self._height)
+        ffv1_encode(data, out_path, self._pix_fmt, self._width, self._height)
         self._groups.append({"start": group_start, "count": n, "file": filename})
         self._group_index += 1
         self._buffer = []
@@ -206,7 +213,7 @@ class _CompressedReader:
             if len(self._cache) >= _FFV1_CACHE_GROUPS:
                 self._cache.pop(next(iter(self._cache)))
             path = os.path.join(self._store_dir, g["file"])
-            self._cache[g["file"]] = _ffv1_decode(
+            self._cache[g["file"]] = ffv1_decode(
                 path, self._pix_fmt, self._width, self._height, self._channels
             )
         return self._cache[g["file"]]

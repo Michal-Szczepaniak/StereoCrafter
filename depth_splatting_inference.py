@@ -19,7 +19,11 @@ from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTempora
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 
 from Forward_Warp import forward_warp
-from splat_store import create_store, open_store, write_meta
+from splat_store import create_store, open_store, write_meta, ffv1_encode, ffv1_decode
+
+DEPTH_QUANT_LEVELS = 65535  # uint16 - quantization step is (chunk range)/65535,
+                             # e.g. a factor of ~6500x finer than a 0.0001 error
+                             # tolerance on a depth range of ~1.0
 
 
 def _format_duration(seconds: float) -> str:
@@ -342,6 +346,10 @@ class DepthCrafterDemo:
 
         output_start = 0
         chunk_files = []
+        chunk_meta = []  # [{"min","max","frames"}, ...] parallel to chunk_files -
+                          # per-CHUNK quantization range (not the global one,
+                          # which isn't known until the whole pass finishes) -
+                          # see DEPTH_QUANT_LEVELS / DepthSplatting for the read side
         global_min = np.inf
         global_max = -np.inf
         prev_tail_latents = None  # last `window_overlap` frames of *latents*
@@ -352,9 +360,14 @@ class DepthCrafterDemo:
         elif os.path.exists(manifest_path):
             with open(manifest_path) as f:
                 manifest = json.load(f)
-            if manifest.get("params") == run_params and manifest.get("chunk_files"):
+            if (
+                manifest.get("params") == run_params
+                and manifest.get("chunk_files")
+                and manifest.get("chunk_meta") is not None  # absent = pre-quantization-era checkpoint, incompatible
+            ):
                 output_start = manifest["output_start"]
                 chunk_files = [os.path.join(checkpoint_dir, name) for name in manifest["chunk_files"]]
+                chunk_meta = manifest["chunk_meta"]
                 global_min = manifest["global_min"]
                 global_max = manifest["global_max"]
                 if output_start > 0 and os.path.exists(latents_path):
@@ -378,6 +391,7 @@ class DepthCrafterDemo:
                         "params": run_params,
                         "output_start": output_start,
                         "chunk_files": [os.path.basename(p) for p in chunk_files],
+                        "chunk_meta": chunk_meta,
                         "global_min": float(global_min),
                         "global_max": float(global_max),
                     },
@@ -465,9 +479,24 @@ class DepthCrafterDemo:
                 global_min = min(global_min, chunk_min)
                 global_max = max(global_max, chunk_max)
 
-                chunk_path = os.path.join(checkpoint_dir, f"depth_{len(chunk_files):06d}.npy")
-                np.save(chunk_path, result)
+                # Quantized to uint16 using THIS CHUNK's own min/max (not the
+                # global one - that isn't known until the whole pass finishes,
+                # since chunks are written as they're produced). Dequantized
+                # back to float32 using this same range in DepthSplatting,
+                # THEN the global normalization is applied exactly as before -
+                # so quantization only adds rounding error, never a range
+                # mismatch. Error is ~(chunk_max-chunk_min)/65535 - orders of
+                # magnitude below a 0.0001 tolerance on a ~1.0-wide depth
+                # range, and disparity (the only thing depth is ever used
+                # for) is quantized to whole/half pixels anyway.
+                chunk_path = os.path.join(checkpoint_dir, f"depth_{len(chunk_files):06d}.mkv")
+                chunk_range = max(float(chunk_max) - float(chunk_min), 1e-12)
+                quantized = np.round((result - chunk_min) / chunk_range * DEPTH_QUANT_LEVELS).astype(np.uint16)
+                ffv1_encode(quantized, chunk_path, "gray16le", original_width, original_height)
                 chunk_files.append(chunk_path)
+                chunk_meta.append({
+                    "min": float(chunk_min), "max": float(chunk_max), "frames": int(result.shape[0]),
+                })
                 if prev_tail_latents is not None:
                     torch.save(prev_tail_latents, latents_path)
 
@@ -494,6 +523,7 @@ class DepthCrafterDemo:
 
             return (
                 chunk_files,
+                chunk_meta,
                 global_min,
                 global_max,
                 target_fps,
@@ -545,6 +575,7 @@ def DepthSplatting(
     input_video_path,
     store_dir,
     chunk_files,
+    chunk_meta,
     global_min,
     global_max,
     max_disp,
@@ -562,12 +593,21 @@ def DepthSplatting(
     splat_store.py). "left" is not duplicated here at all; the inpaint
     stage reads it straight from `input_video_path`.
 
-    compress_store (default True): FFV1-compressed store instead of raw
-    .npy - measured ~7x smaller on real content with a verified bit-exact
-    round-trip, at a CPU decode cost stage 2 never notices (see
+    Each depth chunk is itself FFV1-compressed + uint16-quantized (see
+    DEPTH_QUANT_LEVELS and the write side in DepthCrafterDemo.infer) - decoded
+    and dequantized here using that chunk's own (min, max) from chunk_meta
+    BEFORE the global normalization below, so quantization only adds a tiny
+    per-chunk rounding error, it never depends on knowing the eventual
+    episode-wide range at write time.
+
+    compress_store (default True): FFV1-compressed WARP/MASK store instead
+    of raw .npy - measured ~7x smaller on real content with a verified
+    bit-exact round-trip, at a CPU decode cost stage 2 never notices (see
     splat_store.py's module docstring for the numbers and why plain H.264
     was rejected). Set False to fall back to the original uncompressed
-    format if you ever need to debug/compare against it directly.
+    format if you ever need to debug/compare against it directly. (This
+    only affects warp/mask - the depth checkpoint read below is always
+    quantized+compressed, independent of this flag.)
 
     FIX (carried over): depth chunk index i was computed from source video
     frame i*stride (DepthCrafter runs on a temporally-subsampled clip
@@ -578,7 +618,7 @@ def DepthSplatting(
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     native_num_frames = len(vid_reader)
 
-    total_depth_frames = sum(np.load(path, mmap_mode="r").shape[0] for path in chunk_files)
+    total_depth_frames = sum(m["frames"] for m in chunk_meta)
     # Number of (depth, frame) pairs we can actually produce, bounded by how
     # many strided source frames exist.
     max_pairs_from_source = (native_num_frames + stride - 1) // stride
@@ -624,7 +664,12 @@ def DepthSplatting(
     progress = LiveProgress(num_frames, len(chunk_files))
 
     for chunk_index, chunk_path in enumerate(chunk_files):
-        depth_chunk = np.load(chunk_path, mmap_mode="r")
+        meta_c = chunk_meta[chunk_index]
+        quantized = ffv1_decode(chunk_path, "gray16le", width, height, channels=None, dtype=np.uint16)
+        depth_chunk = (
+            meta_c["min"]
+            + quantized.astype(np.float32) / DEPTH_QUANT_LEVELS * (meta_c["max"] - meta_c["min"])
+        )
         chunk_frames = min(depth_chunk.shape[0], num_frames - frame_offset)
         if chunk_frames <= 0:
             break
@@ -814,6 +859,7 @@ def main(
 
     (
         chunk_files,
+        chunk_meta,
         global_min,
         global_max,
         target_fps,
@@ -841,6 +887,7 @@ def main(
             input_video_path,
             output_dir,
             chunk_files,
+            chunk_meta,
             global_min,
             global_max,
             max_disp,
