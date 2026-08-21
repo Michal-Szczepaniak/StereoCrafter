@@ -24,7 +24,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-: "${HF_TOKEN:?Set HF_TOKEN to a Hugging Face read token first (needed for the gated SVD weights) - see this script's header comment.}"
+: "${HF_TOKEN:?Set HF_TOKEN to a Hugging Face read token first (needed for the gated SVD weights) - see the header comment above.}"
 : "${HF_USERNAME:?Set HF_USERNAME to your Hugging Face username first.}"
 
 echo "==================================================================="
