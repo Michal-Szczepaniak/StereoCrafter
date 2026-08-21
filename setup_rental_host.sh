@@ -145,8 +145,13 @@ fi
 # __file__ is None on it - use __path__ instead, which namespace packages do
 # have.
 nvidia_cudart_dir="$(python -c "import nvidia.cuda_runtime, os; print(os.path.join(list(nvidia.cuda_runtime.__path__)[0], 'lib'))")"
-if [[ -f "$nvidia_cudart_dir"/libcudart.so.11.* && ! -e "$nvidia_cudart_dir/libcudart.so" ]]; then
-    ln -sf "$(ls "$nvidia_cudart_dir"/libcudart.so.11.* | head -1)" "$nvidia_cudart_dir/libcudart.so"
+# NOTE: `[[ -f pattern ]]` does NOT glob-expand - `*` is a literal character
+# inside [[ ]], not a wildcard - so a naive version of this check is always
+# false and the symlink below never gets created. Expand the glob via `ls`
+# instead and check the result is non-empty.
+nvidia_cudart_lib="$(ls "$nvidia_cudart_dir"/libcudart.so.11.* 2>/dev/null | head -1)"
+if [[ -n "$nvidia_cudart_lib" && ! -e "$nvidia_cudart_dir/libcudart.so" ]]; then
+    ln -sf "$nvidia_cudart_lib" "$nvidia_cudart_dir/libcudart.so"
 fi
 export LIBRARY_PATH="$nvidia_cudart_dir:${LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="$nvidia_cudart_dir:${LD_LIBRARY_PATH:-}"
