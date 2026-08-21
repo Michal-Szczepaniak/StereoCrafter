@@ -141,7 +141,10 @@ fi
 # dependency) ships the correct 11.0 lib, just without the unversioned
 # symlink -lcudart looks for. Symlink it and point the linker there
 # directly - guaranteed correct version since torch declared it itself.
-nvidia_cudart_dir="$(python -c "import nvidia.cuda_runtime, os; print(os.path.join(os.path.dirname(nvidia.cuda_runtime.__file__), 'lib'))")"
+# NOTE: nvidia.cuda_runtime is a namespace package (no __init__.py), so
+# __file__ is None on it - use __path__ instead, which namespace packages do
+# have.
+nvidia_cudart_dir="$(python -c "import nvidia.cuda_runtime, os; print(os.path.join(list(nvidia.cuda_runtime.__path__)[0], 'lib'))")"
 if [[ -f "$nvidia_cudart_dir"/libcudart.so.11.* && ! -e "$nvidia_cudart_dir/libcudart.so" ]]; then
     ln -sf "$(ls "$nvidia_cudart_dir"/libcudart.so.11.* | head -1)" "$nvidia_cudart_dir/libcudart.so"
 fi
