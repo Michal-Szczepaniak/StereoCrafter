@@ -56,6 +56,13 @@ if ! conda env list | grep -q "^stereocrafter "; then
 fi
 # shellcheck disable=SC1091
 source "$(conda info --base)/etc/profile.d/conda.sh"
+# conda's own activate.d/deactivate.d hooks (e.g. the one gxx_linux-64 installs
+# below, in step 3) aren't written to be safe under `set -u` - they reference
+# backup vars like CONDA_BACKUP_CXX that are only set in some code paths, and
+# blow up ("unbound variable") under nounset. conda activate/install/remove
+# from here on can trigger those hooks, so nounset gets turned off for the
+# rest of the script rather than fighting conda's scripts one at a time.
+set +u
 conda activate stereocrafter
 
 pip install -r requirements.txt
