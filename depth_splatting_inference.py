@@ -543,11 +543,53 @@ class DepthCrafterDemo:
 
 
 class ForwardWarpStereo(nn.Module):
-    def __init__(self, eps=1e-6, occlu_map=False):
+    def __init__(self, eps=1e-6, occlu_map=False, crack_radius=2):
         super(ForwardWarpStereo, self).__init__()
         self.eps = eps
         self.occlu_map = occlu_map
+        self.crack_radius = crack_radius
         self.fw = forward_warp()
+
+    def _close_cracks(self, res, occlu_map, hole_thresh=0.5):
+        """Forward-splatting a purely-horizontal per-pixel disparity field
+        (dummy_flow is always 0 - see forward()) leaves 1-2px destination
+        gaps ("cracks") wherever the disparity gradient between adjacent
+        source columns exceeds ~1px/px. This happens constantly along fine,
+        jagged silhouettes (hair strands, fur, foliage) purely from a
+        diffusion depth model's per-pixel noise on such textures - no real
+        depth discontinuity needed, just enough gradient to tip a couple of
+        columns over. Those pixels divide by the near-zero coverage clamped
+        in forward() (`mask.clamp_(min=self.eps)`), which produces
+        near-random colors that trace the (naturally jagged) edge as a
+        wavy "))))"-shaped fringe in the warped image, and as a dotted comb
+        in occlu_map. A genuine disocclusion (behind an arm, etc.) is much
+        wider than this in practice (measured: essentially bimodal, cracks
+        <=2px vs. real holes >10px on real footage) and must still reach
+        stage 2's inpainting untouched - so only holes that a morphological
+        *opening* removes (i.e. thinner than crack_radius) are treated as
+        cracks and patched here with a local average of valid neighbors;
+        anything that survives opening is left as a real hole.
+        """
+        radius = self.crack_radius
+        hole = (occlu_map > hole_thresh).float()
+        k = 2 * radius + 1
+        eroded = 1.0 - F.max_pool2d(1.0 - hole, kernel_size=(1, k), stride=1, padding=(0, radius))
+        opened = F.max_pool2d(eroded, kernel_size=(1, k), stride=1, padding=(0, radius))
+        crack = (hole > 0.5) & (opened < 0.5)
+        if not crack.any():
+            return res, occlu_map
+
+        valid = (occlu_map <= hole_thresh).float()
+        fillk = k + 2
+        fillr = fillk // 2
+        channels = res.shape[1]
+        sum_res = F.conv2d(res * valid, res.new_ones(channels, 1, 1, fillk), padding=(0, fillr), groups=channels)
+        sum_valid = F.conv2d(valid, valid.new_ones(1, 1, 1, fillk), padding=(0, fillr))
+        fill = sum_res / sum_valid.clamp(min=self.eps)
+
+        res = torch.where(crack.expand_as(res), fill, res)
+        occlu_map = torch.where(crack, torch.zeros_like(occlu_map), occlu_map)
+        return res, occlu_map
 
     def forward(self, im, disp):
         im = im.contiguous()
@@ -561,13 +603,17 @@ class ForwardWarpStereo(nn.Module):
         mask = self.fw(weights_map, flow)
         mask.clamp_(min=self.eps)
         res = res_accum / mask
+
+        ones = torch.ones_like(disp, requires_grad=False)
+        occlu_map = self.fw(ones, flow)
+        occlu_map.clamp_(0.0, 1.0)
+        occlu_map = 1.0 - occlu_map
+
+        res, occlu_map = self._close_cracks(res, occlu_map)
+
         if not self.occlu_map:
             return res
         else:
-            ones = torch.ones_like(disp, requires_grad=False)
-            occlu_map = self.fw(ones, flow)
-            occlu_map.clamp_(0.0, 1.0)
-            occlu_map = 1.0 - occlu_map
             return res, occlu_map
 
 

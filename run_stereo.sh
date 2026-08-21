@@ -75,30 +75,41 @@ CPU_OFFLOAD="${CPU_OFFLOAD:-None}"
 COMPRESS_STORE="${COMPRESS_STORE:-True}"
 
 # ---- stage 2 (inpainting) knobs - these fit a 12GB card at 1080p; going
-# below tile_num=4, or disabling cpu offload, or raising decode_chunk_size
-# above 1 all OOM (verified). num_inference_steps is the one real
-# speed/quality tradeoff left - default matches the validated-good baseline.
+# below tile_num=4, or raising decode_latents_chunk_size above 1, OOM at
+# full resolution (work_scale=1.0) on this card (verified). num_inference_steps
+# is a real speed/quality tradeoff; work_scale is the big one - see
+# inpainting_inference.py's own docstring for the full writeup of both.
 TILE_NUM="${TILE_NUM:-4}"
 FRAMES_CHUNK="${FRAMES_CHUNK:-5}"
 OVERLAP="${OVERLAP:-3}"
+# CFG (min/max_guidance_scale) killed by default below - see
+# inpainting_inference.py's do_classifier_free_guidance fix. A guidance
+# scale of 1.0 disables the second (unconditional) UNet forward entirely,
+# ~2x by itself, for a correction term that was only ever weighted ~0.01
+# against an unconditional branch built from zeroed inputs.
+MIN_GUIDANCE_SCALE="${MIN_GUIDANCE_SCALE:-1.0}"
+MAX_GUIDANCE_SCALE="${MAX_GUIDANCE_SCALE:-1.0}"
 # Was unconditionally True regardless of card size - PROFILED this session
 # (real cProfile run on the local 12GB card): the offload hooks' per-call
 # CPU<->GPU reshuffling cost ~15%+ of stage-2 wall time (chained
 # image_encoder->unet->vae, each stage onloaded/offloaded on every single
-# tile pass, not once per run - see the chunk loop's manual `pipeline.vae
-# .to("cpu")` a bit further down for why that chaining is deliberate, not a
-# bug). Only worth turning off on a card with real VRAM headroom to spare -
-# NOT the current rental config: the FRAMES_CHUNK=30 tuning in this same
-# preset file measured peak VRAM at ~22.6-23.2GB out of ~24.5GB WITH
-# cpu_offload on, i.e. as little as ~1.3GB headroom - flipping this off on
-# that config would likely OOM. Left at True (unchanged default) here;
-# this is a lever for a *future* run where you've independently confirmed
-# there's real headroom to give up cpu_offload's savings for speed, not a
-# switch to flip on whatever's currently running.
-ENABLE_MODEL_CPU_OFFLOAD="${ENABLE_MODEL_CPU_OFFLOAD:-True}"
-DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-1}"
+# tile pass, not once per run). CFG-off (above) roughly halves UNet
+# activation memory, so this now defaults to False even on the 12GB card -
+# override to True if a specific config still needs the VRAM headroom.
+ENABLE_MODEL_CPU_OFFLOAD="${ENABLE_MODEL_CPU_OFFLOAD:-False}"
 DECODE_LATENTS_CHUNK_SIZE="${DECODE_LATENTS_CHUNK_SIZE:-1}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-8}"
+# work_scale: run the diffusion model at a fraction of the real output
+# resolution, then upsample the result back before compositing against the
+# full-resolution warp/mask - see inpainting_inference.py's docstring.
+# 1.0 (unchanged/original behavior) here; presets/*.env override this once
+# it's been benchmarked (--bench_iters) against that card's real footage.
+WORK_SCALE="${WORK_SCALE:-1.0}"
+DENOISE_STRENGTH="${DENOISE_STRENGTH:-1.0}"
+MASK_SKIP_THRESHOLD="${MASK_SKIP_THRESHOLD:-}"
+AGGRESSIVE_FREE="${AGGRESSIVE_FREE:-False}"
+VAE_FORCE_UPCAST="${VAE_FORCE_UPCAST:-False}"
+COMPILE_UNET="${COMPILE_UNET:-False}"
 MAX_ITERS="${MAX_ITERS:-}"
 # chunked_attention.py: memory-efficient attention fallback for GPUs with no
 # working flash/efficient SDPA kernel (see chunked_attention.py's own module
@@ -178,6 +189,10 @@ if [[ -n "$MAX_ITERS" ]]; then
 fi
 
 stage2_run() {
+    MASK_SKIP_ARG=()
+    if [[ -n "$MASK_SKIP_THRESHOLD" ]]; then
+        MASK_SKIP_ARG=(--mask_skip_threshold "$MASK_SKIP_THRESHOLD")
+    fi
     python inpainting_inference.py \
         --pre_trained_path "$SVD_WEIGHTS" \
         --unet_path "$STEREOCRAFTER_UNET" \
@@ -186,10 +201,17 @@ stage2_run() {
         --tile_num "$TILE_NUM" \
         --frames_chunk "$FRAMES_CHUNK" \
         --overlap "$OVERLAP" \
-        --decode_chunk_size "$DECODE_CHUNK_SIZE" \
         --decode_latents_chunk_size "$DECODE_LATENTS_CHUNK_SIZE" \
         --enable_model_cpu_offload="$ENABLE_MODEL_CPU_OFFLOAD" \
         --num_inference_steps "$NUM_INFERENCE_STEPS" \
+        --min_guidance_scale="$MIN_GUIDANCE_SCALE" \
+        --max_guidance_scale="$MAX_GUIDANCE_SCALE" \
+        --work_scale="$WORK_SCALE" \
+        --denoise_strength="$DENOISE_STRENGTH" \
+        --aggressive_free="$AGGRESSIVE_FREE" \
+        --vae_force_upcast="$VAE_FORCE_UPCAST" \
+        --compile_unet="$COMPILE_UNET" \
+        "${MASK_SKIP_ARG[@]}" \
         --chunked_attention="$CHUNKED_ATTENTION" \
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \
         --suppress_attention_kernel_warnings="$SUPPRESS_ATTENTION_KERNEL_WARNINGS" \

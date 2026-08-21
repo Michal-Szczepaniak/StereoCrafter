@@ -220,7 +220,15 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
     ):
         # f 1 h w
         frames_mask = frames_mask.to(device=device)
-        frames_mask= torch.nn.functional.interpolate(frames_mask,scale_factor=1/self.vae_scale_factor)
+        # OPTIMIZATION/FIX: this was nearest-neighbor interpolate, which can
+        # drop a thin occlusion strip entirely (a ~10px hole is ~1.2 latent
+        # pixels at vae_scale_factor=8 - nearest sampling just picks whichever
+        # sub-pixel lands on the sample point). frames_mask is already
+        # strictly 0.0/1.0 here (mask_processor.preprocess ran do_binarize=True
+        # before this), so max-pool is the correct downsample: it keeps a
+        # latent pixel "on" if ANY covered source pixel was a hole, instead of
+        # silently erasing the model's only signal for where to inpaint.
+        frames_mask = torch.nn.functional.max_pool2d(frames_mask, self.vae_scale_factor)
         frames_mask =frames_mask.unsqueeze(0)
         
         if do_classifier_free_guidance:
@@ -383,8 +391,17 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
+        # OPTIMIZATION: this used to return the raw float on the scalar
+        # branch instead of a bool - harmless as long as guidance_scale > 1
+        # (truthy either way), but meant guidance_scale == 1.0 (i.e. actually
+        # requesting CFG off) was still truthy, and guidance_scale == 0.0
+        # would incorrectly disable it. CFG at min/max_guidance_scale ~= 1.0
+        # buys nothing (the correction term is weighted ~0 against an
+        # unconditional branch built entirely from zeroed inputs) but still
+        # pays for a full extra batch-2 UNet forward every step - this fix is
+        # what lets callers actually turn it off by passing 1.0.
         if isinstance(self.guidance_scale, (int, float)):
-            return self.guidance_scale
+            return float(self.guidance_scale) > 1
         return self.guidance_scale.max() > 1
 
     @property
@@ -405,6 +422,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         fps: int = 7,
         motion_bucket_id: int = 127,
         noise_aug_strength: int = 0.00,
+        denoise_strength: float = 1.0,
         decode_chunk_size: Optional[int] = None,
         vae_encode_chunk_size: Optional[int] = None,
         num_videos_per_prompt: Optional[int] = 1,
@@ -531,15 +549,27 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
 
         # 4. Encode input image using VAE
         frames = self.image_processor.preprocess(frames, height=height, width=width)
-        noise = randn_tensor(frames.shape, generator=generator, device=frames.device, dtype=frames.dtype)
-        frames = frames + noise_aug_strength * noise
-        
+        # OPTIMIZATION: noise_aug_strength defaults to 0.0 (this repo never
+        # sets it otherwise) - the randn_tensor allocation/add is pure waste
+        # in that case since `frames + 0.0 * noise == frames`.
+        if noise_aug_strength > 0:
+            noise = randn_tensor(frames.shape, generator=generator, device=frames.device, dtype=frames.dtype)
+            frames = frames + noise_aug_strength * noise
+
         frames_mask = self.mask_processor.preprocess(frames_mask, height=height,width=width)
 
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
-
+        else:
+            # image_processor.preprocess() always returns float32 regardless
+            # of the VAE's dtype - normally masked by the force_upcast path
+            # above (which upcasts the VAE to match instead). With
+            # force_upcast disabled (vae_force_upcast=False, see
+            # inpainting_inference.py) the VAE stays fp16, so `frames` has to
+            # be cast down to match instead, or conv2d raises "Input type
+            # (float) and bias type (c10::Half) should be the same".
+            frames = frames.to(dtype=self.vae.dtype)
 
         frame_latents = self._encode_vae_frames(
             frames, device, num_videos_per_prompt, self.do_classifier_free_guidance,
@@ -587,6 +617,36 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+
+        # OPTIMIZATION (SDEdit / img2img-style partial denoising): with
+        # denoise_strength < 1.0, skip the leading timesteps and start from
+        # the already-known conditioning image (frame_latents, the VAE
+        # encoding of the prefilled warp - computed above for the channel
+        # concat either way, so this is free) plus noise at that timestep's
+        # sigma, instead of pure noise at sigma_max. Standard Euler img2img
+        # initialization (see e.g. StableDiffusionImg2ImgPipeline.get_timesteps):
+        # scheduler.step() derives its internal step index by matching the
+        # timestep VALUE against the full `self.scheduler.timesteps` it
+        # already has cached from set_timesteps() above, so slicing the
+        # client-side `timesteps` list here is sufficient - no separate
+        # scheduler reset needed.
+        if denoise_strength < 1.0:
+            init_timestep = min(max(int(round(num_inference_steps * denoise_strength)), 1), num_inference_steps)
+            t_start = max(num_inference_steps - init_timestep, 0)
+            timesteps = timesteps[t_start:]
+            sigma_start = self.scheduler.sigmas[t_start].to(device=device, dtype=latents.dtype)
+
+            init_latents = frame_latents
+            if self.do_classifier_free_guidance:
+                # frame_latents is [uncond; cond] batch-concatenated - only
+                # the conditional half is a valid starting image.
+                init_latents = init_latents[init_latents.shape[0] // 2:]
+
+            img2img_noise = randn_tensor(
+                init_latents.shape, generator=generator, device=device, dtype=init_latents.dtype
+            )
+            latents = init_latents + img2img_noise * sigma_start
+            num_inference_steps = len(timesteps)
 
         # 7. Prepare guidance scale
         guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)

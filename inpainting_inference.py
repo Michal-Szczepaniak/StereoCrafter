@@ -82,6 +82,73 @@ class LiveProgress:
         sys.stdout.flush()
 
 
+class PhaseTimer:
+    """Sub-phase wall-clock breakdown of one outer chunk iteration - Phase 0
+    of the stage-2 speed pass. Before this there was zero visibility into
+    where a chunk's time actually went (only a per-chunk wall clock), which
+    made every optimization below (CFG, cpu-offload, work_scale, ...) a guess
+    instead of a measurement.
+
+    GPU-bound phases (`tiled_diffusion`, `vae_decode`) use CUDA events so the
+    reading isn't polluted by asynchronous-launch skew; CPU/disk phases
+    (`read_chunk`, `composite`, `ffmpeg_write`, ...) use wall clock, which is
+    what actually matters for them (they're not overlapped with anything
+    today - see Phase 5 in the plan for why that's the next lever once GPU
+    time comes down).
+
+    Usage: `with phase_timer("read_chunk"): ...` around each phase; call
+    `.report(num_frames)` once at the end (only used by --bench_iters, see
+    main()) to print the table and the derived s/output-frame.
+    """
+
+    _GPU_PHASES = {"tiled_diffusion", "vae_decode"}
+
+    def __init__(self):
+        self.totals = {}
+        self.counts = {}
+
+    def __call__(self, name):
+        return _PhaseCtx(self, name)
+
+    def report(self, num_frames: int):
+        total = sum(self.totals.values())
+        print("\n==> Phase timing breakdown (--bench_iters):")
+        for name, secs in sorted(self.totals.items(), key=lambda kv: -kv[1]):
+            pct = 100 * secs / total if total else 0.0
+            per_call = secs / self.counts[name] if self.counts[name] else 0.0
+            print(f"    {name:16s} {secs:9.2f}s  ({pct:5.1f}%)  {per_call:7.3f}s/call  x{self.counts[name]}")
+        print(f"    {'TOTAL':16s} {total:9.2f}s")
+        if num_frames > 0:
+            print(f"==> {total / num_frames:.3f} s/output-frame over {num_frames} frames")
+
+
+class _PhaseCtx:
+    def __init__(self, timer: PhaseTimer, name: str):
+        self.timer = timer
+        self.name = name
+        self.is_gpu = name in PhaseTimer._GPU_PHASES and torch.cuda.is_available()
+
+    def __enter__(self):
+        if self.is_gpu:
+            self._start_evt = torch.cuda.Event(enable_timing=True)
+            self._end_evt = torch.cuda.Event(enable_timing=True)
+            self._start_evt.record()
+        else:
+            self._start = time.monotonic()
+        return self
+
+    def __exit__(self, *exc_info):
+        if self.is_gpu:
+            self._end_evt.record()
+            torch.cuda.synchronize()
+            elapsed = self._start_evt.elapsed_time(self._end_evt) / 1000.0
+        else:
+            elapsed = time.monotonic() - self._start
+        self.timer.totals[self.name] = self.timer.totals.get(self.name, 0.0) + elapsed
+        self.timer.counts[self.name] = self.timer.counts.get(self.name, 0) + 1
+        return False
+
+
 def _round_up_to_multiple(x: int, multiple: int = 64) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
@@ -99,6 +166,17 @@ def _prefill_occlusion(warp_np: np.ndarray, mask_np: np.ndarray, radius: int = 5
         hole = (mask_np[t] > 127).astype(np.uint8) * 255
         if hole.any():
             out[t] = cv2.inpaint(warp_np[t], hole, radius, cv2.INPAINT_TELEA)
+    return out
+
+
+def _downscale_np(arr: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Per-frame cv2.resize (INTER_AREA - the correct choice for
+    downsampling, avoids aliasing) of a (T,H,W[,C]) uint8 array to
+    (T,height,width[,C]). Used by --work_scale to shrink warp/mask to the
+    diffusion model's working resolution before conditioning."""
+    out = np.empty((arr.shape[0], height, width) + arr.shape[3:], dtype=arr.dtype)
+    for t in range(arr.shape[0]):
+        out[t] = cv2.resize(arr[t], (width, height), interpolation=cv2.INTER_AREA)
     return out
 
 
@@ -121,6 +199,7 @@ def spatial_tiled_process(
     tile_num,
     spatial_n_compress=8,
     progress: "LiveProgress | None" = None,
+    aggressive_free: bool = False,
     **kargs,
 ):
     height = cond_frames.shape[2]
@@ -208,11 +287,14 @@ def spatial_tiled_process(
 
             # OPTIMIZATION (VRAM): with cpu offload, submodules are moved back to
             # CPU after each tile's forward pass, but the caching allocator can
-            # still hold onto fragmented reserved blocks. Reclaim them between
-            # tiles rather than only once per frame chunk - higher tile_num means
-            # more forward passes per chunk, so fragmentation compounds faster.
-            gc.collect()
-            torch.cuda.empty_cache()
+            # still hold onto fragmented reserved blocks. Reclaiming them between
+            # tiles (rather than only once per frame chunk) helps low-VRAM cards
+            # where fragmentation compounds with tile_num, at the cost of a real
+            # allocator round-trip every tile - default OFF (see --aggressive_free)
+            # since it's dead weight on a card with real headroom.
+            if aggressive_free:
+                gc.collect()
+                torch.cuda.empty_cache()
         cols.append(rows)
 
     latent_stride = (tile_stride[0] // spatial_n_compress, tile_stride[1] // spatial_n_compress)
@@ -364,7 +446,6 @@ def main(
     frames_chunk=23,
     overlap=3,
     tile_num=1,
-    decode_chunk_size=8,
     decode_latents_chunk_size=2,
     vae_encode_chunk_size=5,
     enable_model_cpu_offload=False,
@@ -372,15 +453,24 @@ def main(
     enable_vae_slicing=True,
     enable_vae_tiling=False,
     num_inference_steps=8,
-    min_guidance_scale=1.01,
-    max_guidance_scale=1.01,
+    min_guidance_scale=1.0,
+    max_guidance_scale=1.0,
     noise_aug_strength=0.0,
+    denoise_strength=1.0,
+    work_scale=1.0,
+    mask_skip_threshold=None,
     max_iters=None,
     prefill_occlusion=True,
     resume=True,
     chunked_attention=True,
     attention_kv_chunk_size=1024,
     suppress_attention_kernel_warnings=True,
+    aggressive_free=False,
+    vae_force_upcast=False,
+    compile_unet=False,
+    bench_iters=None,
+    bench_start=0,
+    dump_frames=None,
 ):
     """NOTE: --input_video_path is now --splat_store_dir - point it at the
     directory depth_splatting_inference.py wrote (warp.npy + mask.npy +
@@ -416,12 +506,84 @@ def main(
     (O(seq_len) memory, some compute overhead) - lets tile_num go lower
     (bigger tiles, fewer of them) on any card. attention_kv_chunk_size
     trades memory for speed: smaller = less VRAM, more (smaller) matmuls.
+    On CUDA hardware with a real flash/efficient kernel (e.g. this card's
+    rented 4090), set this False: every one of the 66 patched attention
+    modules still pays a warnings.catch_warnings() + sdp_kernel context-
+    manager entry per call even when the fallback itself never triggers.
     suppress_attention_kernel_warnings: chunked_attention always probes for
     a real flash/efficient kernel first (see chunked_attention.py) - on
     hardware where that probe always fails (this GPU), PyTorch logs a
     UserWarning per unavailable backend on every single call, which spams
     the LiveProgress status line. On by default; set False to see them
     again (e.g. to confirm the fast path is engaging on different hardware).
+
+    aggressive_free: gate the gc.collect()+torch.cuda.empty_cache() calls
+    that used to run unconditionally per tile, per decode chunk, and per
+    outer chunk. Those calls are a real allocator round-trip - worth paying
+    on a VRAM-constrained card (e.g. the 12GB ROCm dev box) where
+    fragmentation can turn a would-fit allocation into an OOM, pure waste on
+    a card with real headroom (e.g. the rented 4090). Off by default.
+
+    vae_force_upcast: the VAE's own config ships force_upcast=True, which
+    flips the ENTIRE VAE fp16->fp32->fp16 on every tile call (see
+    pipelines/stereo_video_inpainting.py's needs_upcasting check) and runs
+    the encode step in fp32. Set True to restore that original behavior if
+    fp16 VAE encode/decode ever shows visible NaNs/artifacts on your data;
+    off (fp16 throughout) by default.
+
+    work_scale: the diffusion model's working resolution as a fraction of
+    the real output resolution (1.0 = run at native 1920x1080, no change
+    from before). Occlusion holes are thin edge contours (~1.2% of pixels,
+    measured) scattered across the whole frame, not clustered - so there's
+    no ROI to crop, but there's also no reason to run a full 1080p SVD
+    forward pass to fill them if the input is quietly downscaled and
+    upscaled back. At 0.5, warp+mask are downscaled (aspect-preserving,
+    replicate-padded to the nearest /64) before tiling/diffusion, then the
+    generated result is upsampled (bicubic) back to full resolution before
+    compositing against the FULL-resolution warp/mask - never against a
+    downscaled composite. Sweep this with --bench_iters/--dump_frames
+    before trusting a value other than 1.0 on a real run; UNVERIFIED as
+    shipped (no local GPU capable of running this pipeline to check against).
+
+    mask_skip_threshold: if the whole chunk's downscaled/model-resolution
+    mask never exceeds this (e.g. a static shot, credits, or a fade with no
+    occlusion), skip the diffusion call entirely and pass the prefilled warp
+    straight through as if the model had reproduced it verbatim. None
+    (default) disables this - off unless explicitly requested, since it's
+    unverified against real footage.
+
+    denoise_strength: SDEdit/img2img-style partial denoising - starts the
+    scheduler partway through its schedule from the prefilled warp's own VAE
+    encoding (already computed for the channel-concat conditioning, so this
+    is free) plus noise at that step's sigma, instead of pure noise at
+    sigma_max, and only runs the remaining `num_inference_steps *
+    denoise_strength` steps. 1.0 (default) is unchanged behavior (full
+    schedule from pure noise). See pipelines/stereo_video_inpainting.py's
+    __call__ for the implementation.
+
+    compile_unet: torch.compile(pipeline.unet, dynamic=False). Off by
+    default - this repo's pinned torch==2.0.1/cu117 has no sm_89 (Ada)
+    kernel and JITs from sm_86 PTX, so compilation gains here are unproven;
+    intended for a future torch>=2.6/cu124 stage-2-only environment. Tile
+    shape and frames_chunk are constant for every chunk except the tail, so
+    this should compile once and be reused, if it works at all on whatever
+    torch version is active. Needs triton (inductor's default backend) -
+    checked up front and skipped with a message if missing, since
+    compilation is lazy (happens on the first forward pass, inside the
+    denoising loop) and a plain try/except around torch.compile() itself
+    catches nothing - confirmed empirically on this project's torch 2.13
+    ROCm build (no triton installed): the call succeeds, then the first
+    real forward pass crashes with torch._inductor.exc.TritonMissing.
+
+    bench_iters/bench_start/dump_frames: benchmarking harness for A/B'ing
+    every option above against a real splat store without touching the real
+    checkpoint. --bench_iters N runs N chunks starting at frame
+    --bench_start (default 0) into a throwaway checkpoint dir, prints a
+    PhaseTimer breakdown (see PhaseTimer above) and the derived
+    s/output-frame, then exits - no manifest/segments left behind.
+    --dump_frames DIR additionally writes the first processed chunk's output
+    frames as PNGs to DIR, so different configs can be compared frame-for-
+    frame (works with or without --bench_iters).
     """
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         pre_trained_path, subfolder="image_encoder", variant="fp16", torch_dtype=torch.float16
@@ -436,6 +598,13 @@ def main(
     image_encoder.requires_grad_(False)
     vae.requires_grad_(False)
     unet.requires_grad_(False)
+
+    # OPTIMIZATION: the VAE ships force_upcast=True (fp16 -> fp32 -> fp16 on
+    # every single tile call, see needs_upcasting in
+    # pipelines/stereo_video_inpainting.py). Overriding it here runs the VAE
+    # fully in fp16 - escape hatch is vae_force_upcast=True if that ever
+    # shows visible NaNs/artifacts on real footage.
+    vae.config.force_upcast = vae_force_upcast
 
     pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
         pre_trained_path,
@@ -472,6 +641,29 @@ def main(
             pipeline.vae, kv_chunk_size=attention_kv_chunk_size,
             suppress_probe_warnings=suppress_attention_kernel_warnings,
         )
+    # Read by decode_latents_streaming (pipelines/stereo_video_inpainting.py)
+    # to gate its own per-decode-chunk torch.cuda.empty_cache() - see
+    # aggressive_free's docstring above.
+    pipeline._aggressive_free = aggressive_free
+
+    if compile_unet:
+        # NOTE: torch.compile() itself never raises - compilation is lazy and
+        # actually happens (and can fail) on the FIRST FORWARD PASS, deep
+        # inside the denoising loop, so a try/except around the wrap call
+        # below catches nothing (confirmed empirically: this crashed with
+        # "torch._inductor.exc.TritonMissing" from inside
+        # pipelines/stereo_video_inpainting.py's unet() call, not here).
+        # inductor's default backend needs triton - check for it up front
+        # instead of pretending the try/except protects anything.
+        import importlib.util
+
+        if importlib.util.find_spec("triton") is None:
+            print(
+                "==> compile_unet requested but triton isn't installed (torch.compile's "
+                "default inductor backend needs it) - continuing uncompiled."
+            )
+        else:
+            pipeline.unet = torch.compile(pipeline.unet, dynamic=False)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -485,17 +677,28 @@ def main(
     # height/width: the REAL output resolution - every pixel of the source
     # frame, never cropped.
     height, width = warp_store.shape[1], warp_store.shape[2]
-    # padded_height/padded_width: the canvas the model actually runs on.
-    # UNet/VAE need dims divisible by 64 (see spatial_tiled_process's
-    # tile-size comment), and 1080 (etc.) usually isn't - so pad up to the
-    # nearest multiple of 64 with edge-replicated rows/cols instead of
-    # flooring down and losing real content. The padding is stripped back
-    # off right before each chunk is written (see generated_out below), so
-    # it never reaches the output file.
+    # padded_height/padded_width: the full-resolution canvas, padded up to
+    # the nearest multiple of 64 with edge-replicated rows/cols instead of
+    # flooring down and losing real content (UNet/VAE need dims divisible by
+    # 64 - see spatial_tiled_process's tile-size comment). This is what the
+    # model runs on at work_scale=1.0, and always what the final composite
+    # and output frame are sized to (padding stripped back off before write).
     padded_height = _round_up_to_multiple(height)
     padded_width = _round_up_to_multiple(width)
     pad_bottom = padded_height - height
     pad_right = padded_width - width
+
+    # work_height/work_width: the model's actual working canvas when
+    # work_scale != 1.0 - aspect-preserving downscale of the real (height,
+    # width), then replicate-padded up to /64 the same way as above (never
+    # stretched to fit). At work_scale=1.0 these collapse to the same values
+    # as padded_height/padded_width (raw == real, pad == pad).
+    work_height_raw = max(1, round(height * work_scale))
+    work_width_raw = max(1, round(width * work_scale))
+    work_height = _round_up_to_multiple(work_height_raw)
+    work_width = _round_up_to_multiple(work_width_raw)
+    work_pad_bottom = work_height - work_height_raw
+    work_pad_right = work_width - work_width_raw
 
     fps = meta["fps"]
     store_name = os.path.basename(os.path.normpath(splat_store_dir))
@@ -504,12 +707,10 @@ def main(
     # ------------------------------------------------------------------
     # Checkpoint bootstrap: resume a previous run's progress (one .mkv
     # segment per processed chunk, see FFmpegSegmentWriter) if the params
-    # match, else start fresh. See main()'s docstring.
+    # match, else start fresh. See main()'s docstring. --bench_iters bypasses
+    # all of this - it always starts fresh in a throwaway directory and is
+    # never resumed.
     # ------------------------------------------------------------------
-    checkpoint_dir = os.path.join(save_dir, f".inpaint_checkpoint_{video_name}")
-    manifest_path = os.path.join(checkpoint_dir, "manifest.json")
-    tail_path = os.path.join(checkpoint_dir, "generated_tail.pt")
-
     run_params = {
         "splat_store_dir": os.path.abspath(splat_store_dir),
         "frames_chunk": frames_chunk,
@@ -519,6 +720,9 @@ def main(
         "min_guidance_scale": min_guidance_scale,
         "max_guidance_scale": max_guidance_scale,
         "noise_aug_strength": noise_aug_strength,
+        "denoise_strength": denoise_strength,
+        "work_scale": work_scale,
+        "mask_skip_threshold": mask_skip_threshold,
         "prefill_occlusion": prefill_occlusion,
         "vae_encode_chunk_size": vae_encode_chunk_size,
         "num_frames": num_frames,
@@ -526,29 +730,53 @@ def main(
         "height": height,
     }
 
-    segments = []
-    next_i = 0
-    generated = None
-
-    if not resume:
+    if bench_iters is not None:
+        max_iters = bench_iters
+        checkpoint_dir = os.path.join(save_dir, ".inpaint_bench_tmp")
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
-    elif os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        if manifest.get("params") == run_params and manifest.get("segments"):
-            segments = manifest["segments"]
-            next_i = manifest["next_i"]
-            if next_i > 0 and os.path.exists(tail_path):
-                generated = torch.load(tail_path, map_location="cuda")
-            print(
-                f"==> RESUMING inpainting from checkpoint: {len(segments)} "
-                f"chunk(s) already done, continuing at frame {next_i}"
-            )
-        else:
-            print("==> checkpoint found but parameters differ from this run - starting fresh")
-            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        manifest_path = os.path.join(checkpoint_dir, "manifest.json")
+        tail_path = os.path.join(checkpoint_dir, "generated_tail.pt")
+        segments = []
+        next_i = bench_start
+        generated = None
+    else:
+        checkpoint_dir = os.path.join(save_dir, f".inpaint_checkpoint_{video_name}")
+        manifest_path = os.path.join(checkpoint_dir, "manifest.json")
+        tail_path = os.path.join(checkpoint_dir, "generated_tail.pt")
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
+        segments = []
+        next_i = 0
+        generated = None
+
+        if not resume:
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        elif os.path.exists(manifest_path):
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            if manifest.get("params") == run_params and manifest.get("segments"):
+                segments = manifest["segments"]
+                next_i = manifest["next_i"]
+                if next_i > 0 and os.path.exists(tail_path):
+                    # OPTIMIZATION/FIX: was map_location="cuda", but `generated`
+                    # gets assigned into input_frames_i (a CPU tensor) below -
+                    # that device mismatch raised, and the broad except further
+                    # down silently swallowed it, so EVERY resume was silently
+                    # dropping cross-chunk continuity (a hard seam at the
+                    # resume point) instead of erroring loudly or actually
+                    # working. map_location="cpu" matches where it's used;
+                    # tail is now saved half-precision (see torch.save below)
+                    # so it's cast back up here.
+                    generated = torch.load(tail_path, map_location="cpu").float()
+                print(
+                    f"==> RESUMING inpainting from checkpoint: {len(segments)} "
+                    f"chunk(s) already done, continuing at frame {next_i}"
+                )
+            else:
+                print("==> checkpoint found but parameters differ from this run - starting fresh")
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Any segment file left over from a run that crashed mid-chunk (never
     # got cleanly appended to `segments` + recorded in the manifest) is
@@ -566,10 +794,26 @@ def main(
         os.replace(tmp_path, manifest_path)
 
     def read_chunk(start: int, end: int):
-        """Read only [start, end) frames from the memmap store, padded up to
-        (padded_height, padded_width) with replicated edge pixels. Never
-        touches frames outside this window, and never touches the original
-        video."""
+        """Read only [start, end) frames from the memmap store. Returns
+        (model_mask, model_warp, full_mask, full_warp):
+
+        - model_mask/model_warp: what's actually fed to the diffusion tiling
+          - at work_scale=1.0, full resolution, prefilled, padded to
+            (padded_height, padded_width). At work_scale<1.0, downscaled
+            (aspect-preserving) to (work_height_raw, work_width_raw),
+            prefilled AT that resolution, then padded to (work_height,
+            work_width).
+        - full_mask/full_warp: ALWAYS full resolution, padded to
+          (padded_height, padded_width), used for the final composite and
+          for cropping back to (height, width). At work_scale=1.0 these are
+          literally the same tensors as model_mask/model_warp (no extra
+          work). At work_scale<1.0, full_warp is deliberately the RAW
+          (un-prefilled) warp, not a second full-res TELEA pass: the
+          composite gate below only ever pulls generated content into
+          pixels where full_mask is actually a hole, so everywhere else -
+          where full_warp is used - is already a correct reprojected pixel,
+          and a second prefill pass there would just be discarded work.
+        """
         end = min(end, num_frames)
 
         # np.asarray() on a memmap slice is what actually faults in those
@@ -577,20 +821,35 @@ def main(
         warp_np = np.array(warp_store[start:end], copy=True)
         mask_np = np.array(mask_store[start:end], copy=True)
 
-        if prefill_occlusion:
-            warp_np = _prefill_occlusion(warp_np, mask_np)
-
-        warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
-        del warp_np
-
-        mask = torch.from_numpy(mask_np).float().unsqueeze(1) / 255.0
-        del mask_np
-
+        full_mask = torch.from_numpy(mask_np).float().unsqueeze(1) / 255.0
         if pad_bottom or pad_right:
-            warp = F.pad(warp, (0, pad_right, 0, pad_bottom), mode="replicate")
-            mask = F.pad(mask, (0, pad_right, 0, pad_bottom), mode="replicate")
+            full_mask = F.pad(full_mask, (0, pad_right, 0, pad_bottom), mode="replicate")
 
-        return mask, warp
+        if work_scale != 1.0:
+            warp_small_np = _downscale_np(warp_np, work_height_raw, work_width_raw)
+            mask_small_np = _downscale_np(mask_np, work_height_raw, work_width_raw)
+            if prefill_occlusion:
+                warp_small_np = _prefill_occlusion(warp_small_np, mask_small_np)
+
+            model_warp = torch.from_numpy(warp_small_np).permute(0, 3, 1, 2).float() / 255.0
+            model_mask = torch.from_numpy(mask_small_np).float().unsqueeze(1) / 255.0
+            if work_pad_bottom or work_pad_right:
+                model_warp = F.pad(model_warp, (0, work_pad_right, 0, work_pad_bottom), mode="replicate")
+                model_mask = F.pad(model_mask, (0, work_pad_right, 0, work_pad_bottom), mode="replicate")
+
+            full_warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
+            if pad_bottom or pad_right:
+                full_warp = F.pad(full_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
+        else:
+            if prefill_occlusion:
+                warp_np = _prefill_occlusion(warp_np, mask_np)
+            model_warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
+            if pad_bottom or pad_right:
+                model_warp = F.pad(model_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
+            model_mask = full_mask
+            full_warp = model_warp
+
+        return model_mask, model_warp, full_mask, full_warp
 
     # NOTE: `generated` was already set above during checkpoint bootstrap -
     # either the resumed tail tensor, or None for a fresh start.
@@ -609,6 +868,7 @@ def main(
     iter_start = None
     completed = False
     progress = LiveProgress(num_frames, total_iters)
+    phase_timer = PhaseTimer()
     with torch.inference_mode():  # OPTIMIZATION: skip autograd bookkeeping entirely
         i = next_i
         while True:
@@ -627,8 +887,8 @@ def main(
                 cur_i = i
                 cur_overlap = overlap
 
-            mask_i, warp_i = read_chunk(cur_i, cur_i + frames_chunk)
-            input_frames_i = warp_i  # warp_i is already a fresh clone, safe to mutate
+            with phase_timer("read_chunk"):
+                model_mask_i, input_frames_i, mask_i, warp_i = read_chunk(cur_i, cur_i + frames_chunk)
 
             iter_index += 1
             if iter_durations:
@@ -654,121 +914,173 @@ def main(
                         f"input_frames_i: {input_frames_i.shape}, generated: {generated.shape}"
                     )
 
-            video_latents = spatial_tiled_process(
-                input_frames_i,
-                mask_i,
-                pipeline,
-                tile_num,
-                spatial_n_compress=8,
-                progress=progress,
-                min_guidance_scale=min_guidance_scale,
-                max_guidance_scale=max_guidance_scale,
-                decode_chunk_size=decode_chunk_size,
-                vae_encode_chunk_size=vae_encode_chunk_size,
-                fps=7,
-                motion_bucket_id=127,
-                noise_aug_strength=noise_aug_strength,
-                num_inference_steps=num_inference_steps,
+            skip_diffusion = (
+                mask_skip_threshold is not None
+                and model_mask_i.max().item() < mask_skip_threshold
             )
-            video_latents = video_latents.unsqueeze(0)
 
-            # NOTE: original code had `if video_latents == torch.float16:` here,
-            # comparing a Tensor to a dtype object - that's always False and the
-            # intended cast never ran. vae is already loaded fp16, so this was a
-            # silent no-op; removed rather than "fixed" since it wasn't doing
-            # anything useful even when working.
+            if skip_diffusion:
+                with phase_timer("mask_skip"):
+                    generated = input_frames_i.clone()
+            else:
+                with phase_timer("tiled_diffusion"):
+                    video_latents = spatial_tiled_process(
+                        input_frames_i,
+                        model_mask_i,
+                        pipeline,
+                        tile_num,
+                        spatial_n_compress=8,
+                        progress=progress,
+                        aggressive_free=aggressive_free,
+                        min_guidance_scale=min_guidance_scale,
+                        max_guidance_scale=max_guidance_scale,
+                        vae_encode_chunk_size=vae_encode_chunk_size,
+                        fps=7,
+                        motion_bucket_id=127,
+                        noise_aug_strength=noise_aug_strength,
+                        denoise_strength=denoise_strength,
+                        num_inference_steps=num_inference_steps,
+                    )
+                    video_latents = video_latents.unsqueeze(0)
 
-            decoded_frames = []
+                # NOTE: original code had `if video_latents == torch.float16:` here,
+                # comparing a Tensor to a dtype object - that's always False and the
+                # intended cast never ran. vae is already loaded fp16, so this was a
+                # silent no-op; removed rather than "fixed" since it wasn't doing
+                # anything useful even when working.
 
-            for decoded_chunk in pipeline.decode_latents_streaming(
-                video_latents,
-                num_frames=video_latents.shape[1],
-                decode_chunk_size=decode_latents_chunk_size,
-            ):
-                # decode_latents_streaming yields the VAE decoder's raw
-                # output, which is in ~[-1, 1] - not [0, 1]. The old code
-                # path went through tensor2vid()/VaeImageProcessor.postprocess,
-                # which denormalizes with (x / 2 + 0.5) before clamping; this
-                # streaming path skipped that, so clamping straight to [0, 1]
-                # was crushing every negative value to black and clipping the
-                # rest, which read as blown-out/cranked color and clipped-edge
-                # noise in the output.
-                decoded_chunk = (decoded_chunk / 2 + 0.5).clamp(0, 1)
+                decoded_frames = []
+                with phase_timer("vae_decode"):
+                    for decoded_chunk in pipeline.decode_latents_streaming(
+                        video_latents,
+                        num_frames=video_latents.shape[1],
+                        decode_chunk_size=decode_latents_chunk_size,
+                    ):
+                        # decode_latents_streaming yields the VAE decoder's raw
+                        # output, which is in ~[-1, 1] - not [0, 1]. The old code
+                        # path went through tensor2vid()/VaeImageProcessor.postprocess,
+                        # which denormalizes with (x / 2 + 0.5) before clamping; this
+                        # streaming path skipped that, so clamping straight to [0, 1]
+                        # was crushing every negative value to black and clipping the
+                        # rest, which read as blown-out/cranked color and clipped-edge
+                        # noise in the output.
+                        decoded_chunk = (decoded_chunk / 2 + 0.5).clamp(0, 1)
 
-                # [frames, channels, height, width]
-                for frame in decoded_chunk:
-                    decoded_frames.append(frame)
+                        # [frames, channels, height, width]
+                        for frame in decoded_chunk:
+                            decoded_frames.append(frame)
 
-            generated = torch.stack(decoded_frames)
+                generated = torch.stack(decoded_frames)
 
-            # cpu offload chains image_encoder->unet->vae: each stage is only
-            # offloaded back to CPU when the *next* stage's forward starts, so
-            # vae (last in the chain) would otherwise sit on GPU until the
-            # chain wraps around at the next chunk's first tile - overlapping
-            # with image_encoder/unet onloading right at that boundary. Force
-            # it off proactively instead of waiting for that handshake.
-            if enable_model_cpu_offload or enable_sequential_cpu_offload:
-                pipeline.vae.to("cpu")
+                # OPTIMIZATION (VRAM): free GPU-side intermediates as soon as we're
+                # done with them instead of waiting for the next loop iteration's
+                # allocations to trigger the allocator. Gated behind aggressive_free
+                # (see its docstring) - a real allocator round-trip, pure waste on a
+                # card with headroom to spare.
+                del video_latents
+                if aggressive_free:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-            # OPTIMIZATION (VRAM): free GPU-side intermediates as soon as we're
-            # done with them instead of waiting for the next loop iteration's
-            # allocations to trigger the allocator.
-            del video_latents
-            gc.collect()
-            torch.cuda.empty_cache()
+            with phase_timer("upsample_back"):
+                if work_scale != 1.0:
+                    gen_cropped = generated[:, :, :work_height_raw, :work_width_raw]
+                    generated_full = F.interpolate(
+                        gen_cropped, size=(padded_height, padded_width), mode="bicubic", align_corners=False
+                    ).clamp(0, 1)
+                else:
+                    generated_full = generated
 
             if i != 0:
-                generated_out = generated[cur_overlap:]
+                generated_out = generated_full[cur_overlap:]
                 mask_out = mask_i[cur_overlap:]
                 warp_out = warp_i[cur_overlap:]
             else:
-                generated_out = generated
+                generated_out = generated_full
                 mask_out = mask_i
                 warp_out = warp_i
 
             # Strip the replicate-padding added in read_chunk back off - the
-            # model ran on (padded_height, padded_width), but the file on
-            # disk should only ever contain the real (height, width) frame.
+            # model ran on a padded canvas, but the file on disk should only
+            # ever contain the real (height, width) frame.
             if pad_bottom or pad_right:
                 generated_out = generated_out[:, :, :height, :width]
                 mask_out = mask_out[:, :, :height, :width]
                 warp_out = warp_out[:, :, :height, :width]
 
-            # The model is only conditioned on `mask` to tell it where the
-            # occlusion holes are - nothing was previously stopping its output
-            # from being used verbatim outside those holes too, where warp_i
-            # already had a correct reprojected pixel. SVD's non-causal
-            # temporal attention means frames near the trailing edge of a
-            # diffusion window can drift/hallucinate well outside the masked
-            # region (e.g. a fast-motion effect a couple frames before it
-            # actually starts in the source). Compositing back through the
-            # mask here means the model can only actually change pixels
-            # inside the holes it was asked to fill.
-            generated_out = mask_out * generated_out + (1 - mask_out) * warp_out
+            with phase_timer("composite"):
+                # The model is only conditioned on `mask` to tell it where the
+                # occlusion holes are - nothing was previously stopping its output
+                # from being used verbatim outside those holes too, where warp_i
+                # already had a correct reprojected pixel. SVD's non-causal
+                # temporal attention means frames near the trailing edge of a
+                # diffusion window can drift/hallucinate well outside the masked
+                # region (e.g. a fast-motion effect a couple frames before it
+                # actually starts in the source). Compositing back through the
+                # mask here means the model can only actually change pixels
+                # inside the holes it was asked to fill.
+                #
+                # OPTIMIZATION/FIX: previously blended with the raw soft
+                # mask_out directly, which is non-zero on ~20% of pixels
+                # (measured) at low alpha near hole edges/antialiasing - while
+                # the model was only ever conditioned on the ~1.2% BINARIZED
+                # region (mask_processor.preprocess uses do_binarize=True).
+                # That low-alpha halo was smearing generated content into a
+                # fifth of the frame that the model was never actually told
+                # was a hole. Gate it back to the binarized region the model
+                # actually saw: mask_out is already ~0/1 (source mask is
+                # near-binary), so this clamp is nearly a no-op numerically,
+                # but removes any soft edge from surviving into the blend.
+                mask_gate = ((mask_out - 0.5) / 0.5).clamp(0, 1)
+                generated_out = mask_gate * generated_out + (1 - mask_gate) * warp_out
 
             # OPTIMIZATION: write this chunk to disk now instead of appending to
             # a list that holds the entire output video in RAM until the end.
             # Each chunk gets its own segment file, checkpointed immediately
             # after it's cleanly written - see FFmpegSegmentWriter/main()'s
             # docstring for why (resumable, no moov-atom finalization risk).
-            gen_u8 = _to_uint8_rgb(generated_out)
-            seg_name = f"seg_{len(segments):06d}.mkv"
-            seg_writer = FFmpegSegmentWriter(os.path.join(checkpoint_dir, seg_name), fps, width, height)
-            seg_writer.write(gen_u8)
-            seg_writer.release()
+            with phase_timer("to_uint8"):
+                gen_u8 = _to_uint8_rgb(generated_out)
+
+            if dump_frames is not None and len(segments) == 0:
+                os.makedirs(dump_frames, exist_ok=True)
+                for fi, frame in enumerate(gen_u8):
+                    cv2.imwrite(
+                        os.path.join(dump_frames, f"frame_{fi:04d}.png"),
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    )
+
+            with phase_timer("ffmpeg_write"):
+                seg_name = f"seg_{len(segments):06d}.mkv"
+                seg_writer = FFmpegSegmentWriter(os.path.join(checkpoint_dir, seg_name), fps, width, height)
+                seg_writer.write(gen_u8)
+                seg_writer.release()
             segments.append(seg_name)
 
             del mask_i, warp_i, generated_out, gen_u8
 
             i += frames_chunk - overlap
             next_i = i
-            torch.save(generated, tail_path)
-            save_checkpoint()
+            with phase_timer("tail_save"):
+                # OPTIMIZATION: was fp32 (~750MB/chunk) - the tail is only
+                # ever read back at fp32 precision-insensitive continuity
+                # (blended input for the next chunk's overlap region), so
+                # half precision (~4x smaller, faster to write/read) costs
+                # nothing visible. Cast back to float on load, see above.
+                torch.save(generated.half(), tail_path)
+            with phase_timer("checkpoint_save"):
+                save_checkpoint()
             progress.finish_iter()
 
             if max_iters is not None and iter_index >= max_iters:
-                print(f"==> Stopping early: reached max_iters={max_iters}")
+                if bench_iters is None:
+                    print(f"==> Stopping early: reached max_iters={max_iters}")
                 break
+
+    if bench_iters is not None:
+        phase_timer.report(num_frames=next_i - bench_start)
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        return
 
     if not completed:
         print(
