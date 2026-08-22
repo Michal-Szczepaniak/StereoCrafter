@@ -21,6 +21,25 @@ from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 from Forward_Warp import forward_warp
 from splat_store import create_store, open_store, write_meta, ffv1_encode, ffv1_decode
 
+# TF32 + cudnn.benchmark: no accuracy-relevant impact on this workload (TF32's
+# 19-bit mantissa vs fp32's 23-bit is inconsequential against an already-noisy
+# generative model; cudnn.benchmark only affects conv algorithm selection, not
+# precision) - real speedup on the VAE's fp32 encode/decode path, and
+# WINDOW_SIZE=70 keeps chunk shapes stable enough for the autotune cost to
+# amortize. NVIDIA/CUDA only - no effect on ROCm.
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # cudnn.benchmark deliberately NOT enabled here - measured directly
+    # (prior session, real rental 4090): with it on, a 240-frame run went
+    # from an established ~0.80 s/frame baseline to 1.68 s/frame (403s
+    # total) - 2x SLOWER, not faster. Streaming chunk/window shapes
+    # apparently vary enough (last-chunk frame count, internal window
+    # discard/overlap trimming) that cudnn keeps re-benchmarking instead of
+    # amortizing one cached choice. Do not re-enable without re-verifying
+    # end-to-end wall time, not just a single op's microbenchmark.
+    # torch.backends.cudnn.benchmark = True
+
 DEPTH_QUANT_LEVELS = 65535  # uint16 - quantization step is (chunk range)/65535,
                              # e.g. a factor of ~6500x finer than a 0.0001 error
                              # tolerance on a depth range of ~1.0
@@ -227,6 +246,7 @@ class DepthCrafterDemo:
         save_depth: bool = False,
         chunk_size: int = 110,
         resume: bool = True,
+        decode_chunk_size: int = 8,
     ):
         """window_size/window_overlap control DepthCrafter's OWN internal
         sliding-window inference within a single self.pipe() call - these
@@ -342,6 +362,7 @@ class DepthCrafterDemo:
             "num_denoising_steps": num_denoising_steps,
             "seed": seed,
             "target_fps": target_fps,
+            "decode_chunk_size": decode_chunk_size,
         }
 
         output_start = 0
@@ -432,6 +453,7 @@ class DepthCrafterDemo:
                         overlap=window_overlap,
                         track_time=track_time,
                         carry_latents=prev_tail_latents,
+                        decode_chunk_size=decode_chunk_size,
                     ).frames[0]
 
                 # Stash this call's tail latents (already crossfaded/continuous by
@@ -448,6 +470,38 @@ class DepthCrafterDemo:
                     "max=", np.nanmax(result),
                 )
 
+                # NEAREST (not bilinear): depth is not a color image - at a
+                # real foreground/background silhouette boundary there is no
+                # gradual gradient in reality, only a hard drop, so
+                # bilinearly blending across it manufactures fictitious
+                # intermediate depth values that correspond to no real
+                # surface. Measured directly (prior session): that fabricated
+                # soft blend is what made the exact boundary column
+                # hair-trigger unstable row-to-row during upsampling, which
+                # is what produced the dotted/wavy fringe along character
+                # silhouettes in the final splat mask/warp. nearest gives a
+                # blockier (staircase) but monotonic edge that tracks the
+                # low-res model's own (already smooth) curve exactly,
+                # instead of zigzagging.
+                #
+                # SWITCHED BACK TO BILINEAR (this session, current status):
+                # seed-controlled A/B testing (fixed --seed across runs, so
+                # only the stage-1 pipeline differs) on a fine/jagged edge
+                # (a character's hair against a busy background) showed
+                # nearest produces visible speckle there that survives all
+                # the way into the final stage-2 painted output, while
+                # bilinear is clean on that same seed - i.e. the row-to-row
+                # jitter nearest was chosen to fix is a real but SEPARATE
+                # problem from DepthCrafter's own per-pixel noise on fine
+                # texture, which bilinear's smoothing actually helps with
+                # and nearest's exact block-preservation faithfully
+                # reproduces as visible noise. Re-enabling crack-closing or
+                # changing window_size did NOT fix the speckle with nearest -
+                # only switching to bilinear did, isolated one variable at a
+                # time. NOTE: a separate defect (a jagged notch on one large,
+                # simple silhouette edge) was measured to persist under
+                # BOTH nearest and bilinear - this switch does not fix that
+                # one, it's still an open problem.
                 tensor_res = torch.from_numpy(result).unsqueeze(1).float().cuda()
                 result = F.interpolate(
                     tensor_res,
@@ -543,11 +597,13 @@ class DepthCrafterDemo:
 
 
 class ForwardWarpStereo(nn.Module):
-    def __init__(self, eps=1e-6, occlu_map=False, crack_radius=2):
+    def __init__(self, eps=1e-6, occlu_map=False, crack_radius=2, disp_tolerance=1.0, use_zbuffer_splat=True):
         super(ForwardWarpStereo, self).__init__()
         self.eps = eps
         self.occlu_map = occlu_map
         self.crack_radius = crack_radius
+        self.disp_tolerance = disp_tolerance
+        self.use_zbuffer_splat = use_zbuffer_splat
         self.fw = forward_warp()
 
     def _close_cracks(self, res, occlu_map, hole_thresh=0.5):
@@ -591,9 +647,15 @@ class ForwardWarpStereo(nn.Module):
         occlu_map = torch.where(crack, torch.zeros_like(occlu_map), occlu_map)
         return res, occlu_map
 
-    def forward(self, im, disp):
-        im = im.contiguous()
-        disp = disp.contiguous()
+    def _forward_legacy_cuda_splat(self, im, disp):
+        """Original bilinear splat via the compiled Forward-Warp CUDA/HIP
+        extension. Kept only for side-by-side A/B diffing against the
+        z-buffer path below (use_zbuffer_splat=False) - this is the exact
+        code that produces the cross-eye conflict bug documented on
+        _zbuffer_splat, since it blends near/far source pixels landing in
+        the same destination footprint via a normalized weighted average
+        with no depth comparison at all.
+        """
         weights_map = disp - disp.min()
         weights_map = (1.414) ** weights_map
         flow = -disp.squeeze(1)
@@ -608,7 +670,149 @@ class ForwardWarpStereo(nn.Module):
         occlu_map = self.fw(ones, flow)
         occlu_map.clamp_(0.0, 1.0)
         occlu_map = 1.0 - occlu_map
+        return res, occlu_map
 
+    def _zbuffer_splat(self, im, disp):
+        """Pure-PyTorch bilinear splat, gated by a per-destination-pixel
+        z-buffer of signed disparity (larger disp = nearer, see disp_map's
+        construction in DepthSplatting: `batch_depth*2-1` then `*max_disp`).
+
+        The original CUDA splat (_forward_legacy_cuda_splat) blends any
+        source pixels that land in the same destination footprint via a
+        normalized weighted average, with NO depth comparison - a
+        far-surface pixel right behind a near silhouette edge is never
+        excluded, only down-weighted by the (near-biased) 1.414**disp
+        term. On natural, soft-gradient footage this is close to
+        invisible; on cel-shaded anime with hard ink outlines it produces
+        a visible defocus/smear band along every silhouette edge, and
+        worse: the right eye ends up seeing a soft blend of content with
+        no corresponding sharp edge in the left eye at that same disparity
+        boundary - a depth cue that never occurs in nature.
+
+        Fix: for each destination pixel, find the nearest (max signed disp)
+        candidate that would land there, then only accept OTHER candidates
+        within `disp_tolerance` of that winner. This still blends smoothly
+        across genuine continuous depth gradients (the common case) but
+        hard-cuts at a silhouette discontinuity, trading a 1-2px alias/hard
+        edge for eliminating the cross-eye conflict - the user's explicit
+        preference.
+
+        Flow is always purely horizontal in this pipeline (dummy_flow=0
+        below), so the destination row always equals the source row - this
+        collapses the general 4-corner bilinear splat to a 1D, per-row,
+        2-column scatter along width, a direct fit for scatter_reduce_/
+        scatter_add_ on dim=-1 with no flat-index arithmetic needed.
+        """
+        B, C, H, W = im.shape
+        device = im.device
+        dtype = im.dtype
+
+        disp_bhw = disp.squeeze(1)  # [B,H,W]
+        # unchanged near-bias weight (global min, matching the legacy path)
+        exp_w = (1.414) ** (disp_bhw - disp_bhw.min())
+
+        w_idx = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)
+        x = w_idx - disp_bhw  # dest x-coord (flow_x = -disp, flow_y = 0)
+        x_f_i = torch.floor(x).long()
+        x_c_i = x_f_i + 1
+        w_f = x_c_i.to(dtype) - x
+        w_c = 1.0 - w_f
+
+        in_bounds = (x_f_i >= 0) & (x_c_i <= W - 1)
+        # NOTE: no small-weight corner drop here (an earlier version gated
+        # keep_f/keep_c on w_f/w_c >= 0.25, "borrowed" from an assumption
+        # about the upstream kernel never independently verified against
+        # real data) - measured on real footage, that dropped one of a
+        # source pixel's two destination contributions for ~50% of all
+        # pixels (whenever its subpixel offset put one corner's weight
+        # below 0.25, which is roughly 50% of the time for continuously
+        # varying disp), producing widespread partial-coverage speckle
+        # ("wave artifacts") across the ENTIRE frame, not just at edges -
+        # confirmed by measuring frac(occlu_map>0.01) stayed ~50% even at
+        # disp_tolerance=100 (where the depth-gate below is effectively a
+        # no-op), vs. legacy's ~14%. Always keeping both corners (matching
+        # the legacy path exactly, gated only by disp_tolerance below) is
+        # what makes gentle continuous regions reproduce the legacy output.
+        keep_f = in_bounds
+        keep_c = in_bounds
+
+        # Pass 1: z-buffer of the winning (max signed disp / nearest) source
+        # per destination pixel. Gated-out/OOB candidates sink into a dummy
+        # extra column (index W) so they can never corrupt a real max.
+        NEG = -1.0e4
+        zbuf = torch.full((B, H, W + 1), NEG, dtype=dtype, device=device)
+        idx_f = torch.where(keep_f, x_f_i, torch.full_like(x_f_i, W))
+        idx_c = torch.where(keep_c, x_c_i, torch.full_like(x_c_i, W))
+        zbuf.scatter_reduce_(2, idx_f, disp_bhw, reduce="amax", include_self=True)
+        zbuf.scatter_reduce_(2, idx_c, disp_bhw, reduce="amax", include_self=True)
+        zbuf = zbuf[..., :W]
+
+        # Pass 2: gate each contribution by tolerance from its destination's
+        # local winner, then accumulate.
+        idx_f_c = x_f_i.clamp(0, W - 1)
+        idx_c_c = x_c_i.clamp(0, W - 1)
+        winner_f = zbuf.gather(2, idx_f_c)
+        winner_c = zbuf.gather(2, idx_c_c)
+        accept_f = keep_f & (winner_f - disp_bhw <= self.disp_tolerance)
+        accept_c = keep_c & (winner_c - disp_bhw <= self.disp_tolerance)
+
+        zero = torch.zeros_like(disp_bhw)
+        wc_mask_f = torch.where(accept_f, w_f * exp_w, zero)
+        wc_mask_c = torch.where(accept_c, w_c * exp_w, zero)
+        wc_cov_f = torch.where(accept_f, w_f, zero)
+        wc_cov_c = torch.where(accept_c, w_c, zero)
+
+        mask_accum = torch.zeros(B, H, W, dtype=dtype, device=device)
+        mask_accum.scatter_add_(2, idx_f_c, wc_mask_f)
+        mask_accum.scatter_add_(2, idx_c_c, wc_mask_c)
+
+        occl_accum = torch.zeros(B, H, W, dtype=dtype, device=device)
+        occl_accum.scatter_add_(2, idx_f_c, wc_cov_f)
+        occl_accum.scatter_add_(2, idx_c_c, wc_cov_c)
+
+        idx_f_exp = idx_f_c.unsqueeze(1).expand(-1, C, -1, -1).reshape(B * C, H, W)
+        idx_c_exp = idx_c_c.unsqueeze(1).expand(-1, C, -1, -1).reshape(B * C, H, W)
+        src_f = (im * wc_mask_f.unsqueeze(1)).reshape(B * C, H, W)
+        src_c = (im * wc_mask_c.unsqueeze(1)).reshape(B * C, H, W)
+
+        res_accum = torch.zeros(B * C, H, W, dtype=dtype, device=device)
+        res_accum.scatter_add_(2, idx_f_exp, src_f)
+        res_accum.scatter_add_(2, idx_c_exp, src_c)
+        res_accum = res_accum.reshape(B, C, H, W)
+
+        mask_accum = mask_accum.clamp(min=self.eps)
+        res = res_accum / mask_accum.unsqueeze(1)
+
+        occl_accum = occl_accum.clamp(0.0, 1.0)
+        occlu_map = 1.0 - occl_accum
+        occlu_map = occlu_map.unsqueeze(1)
+        return res, occlu_map
+
+    def forward(self, im, disp):
+        im = im.contiguous()
+        disp = disp.contiguous()
+
+        if self.use_zbuffer_splat:
+            res, occlu_map = self._zbuffer_splat(im, disp)
+        else:
+            res, occlu_map = self._forward_legacy_cuda_splat(im, disp)
+
+        # RE-ENABLED at crack_radius=2 (this session): a prior session
+        # disabled this entirely after finding crack_radius=8 swallowed
+        # genuine 1-5px disocclusion holes on one clip. But seed-controlled
+        # A/B testing this session found the opposite problem at radius=2
+        # OFF: DepthCrafter's own per-pixel noise on fine/jagged silhouettes
+        # (hair strands specifically) survives as a visible dithered/
+        # checkered stipple along the whole boundary, in the actual final
+        # stage-2 painted output, not just the raw mask - confirmed at full
+        # production scale (max_res=768, real flash attention) on a rented
+        # 4090. Bilinear upsampling alone did not fix it; crack_radius=2
+        # (not 8) alongside bilinear did, isolated one variable at a time.
+        # Radius=2 is intentionally the ORIGINAL (smaller) default, not the
+        # 8 that caused the swallowing problem elsewhere - has NOT yet been
+        # re-verified against that original large-disocclusion-swallowing
+        # scenario on this content; if genuine holes start disappearing
+        # again, that's the first thing to re-check.
         res, occlu_map = self._close_cracks(res, occlu_map)
 
         if not self.occlu_map:
@@ -632,6 +836,7 @@ def DepthSplatting(
     original_width,
     store_params=None,
     compress_store=True,
+    disp_tolerance=1.0,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -698,7 +903,26 @@ def DepthSplatting(
     print(f"==> writing splat store to: {store_dir}")
     print(f"==> ({num_frames} x {height} x {width}) warp uint8 + mask uint8, no grid, no depth-vis")
 
-    stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+    # crack_radius=4 (kernel width 9), up from the class default of 2: measured
+    # directly off a real splat store (see conversation/PR history), a fast
+    # zoom/pan frame with a steep near-vertical depth discontinuity produced
+    # 336 of 358 hole runs at EXACTLY 5px wide - precisely the width of the
+    # default radius=2 opening kernel (k=2*radius+1=5). A run exactly as wide
+    # as the opening's structuring element survives erosion+dilate untouched,
+    # so these were misclassified as genuine disocclusions and left
+    # unpatched, producing a visible speckled/dotted fringe in both the raw
+    # warp and the final inpainted output (confirmed identical in both -
+    # this is a stage-1 splatting artifact, not a stage-2 inpainting one).
+    # radius=4 (k=9) closes runs up to 8px, comfortably below the
+    # class docstring's own measured >10px real-hole threshold, so genuine
+    # disocclusions are unaffected.
+    # REVERTED (prior session's z-buffer splat did not fix the reported
+    # defect - see ForwardWarpStereo docstring/_zbuffer_splat for the
+    # postmortem) - back to the original legacy CUDA blend path in
+    # production while the real cause is re-investigated.
+    stereo_projector = ForwardWarpStereo(
+        occlu_map=True, crack_radius=2, disp_tolerance=disp_tolerance, use_zbuffer_splat=False
+    ).cuda()
 
     frame_offset = 0
 
@@ -852,6 +1076,8 @@ def main(
     guidance_scale: float = 1.0,
     resume: bool = True,
     compress_store: bool = True,
+    disp_tolerance: float = 1.0,
+    decode_chunk_size: int = 8,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -891,6 +1117,8 @@ def main(
         "target_fps": target_fps,
         "num_denoising_steps": num_denoising_steps,
         "guidance_scale": guidance_scale,
+        "disp_tolerance": disp_tolerance,
+        "decode_chunk_size": decode_chunk_size,
     }
     if resume and _store_is_complete(output_dir, store_params):
         print(f"==> Stage 1 already complete for these params - reusing existing store at {output_dir}")
@@ -926,6 +1154,7 @@ def main(
         num_denoising_steps=num_denoising_steps,
         guidance_scale=guidance_scale,
         resume=resume,
+        decode_chunk_size=decode_chunk_size,
     )
 
     try:
@@ -944,6 +1173,7 @@ def main(
             original_width,
             store_params=store_params,
             compress_store=compress_store,
+            disp_tolerance=disp_tolerance,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")

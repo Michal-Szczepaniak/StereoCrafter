@@ -46,6 +46,25 @@ STEREOCRAFTER_UNET="${STEREOCRAFTER_UNET:-./weights/StereoCrafter}"
 # ---- stage 1 (depth splatting) knobs ----
 MAX_RES="${MAX_RES:-384}"
 MAX_DISP="${MAX_DISP:-20.0}"
+# Signed-disparity tolerance window for the z-buffer-gated splat
+# (ForwardWarpStereo._zbuffer_splat): a contribution blends in only if its
+# disp is within this many units of the local winning (nearest) disp at
+# that destination pixel - anything farther is hard-excluded instead of
+# blended, fixing the cross-eye conflict at silhouette edges. Unmeasured
+# default - bench-verify before trusting for an unattended run (see
+# depth_splatting_inference.py's ForwardWarpStereo docstring).
+DISP_TOLERANCE="${DISP_TOLERANCE:-1.0}"
+# DepthCrafter's own VAE encode/decode batch size (unrelated to stage 2's
+# DECODE_LATENTS_CHUNK_SIZE) - MEASURED this session on a real rental 4090:
+# VAE encode+decode was 43% of total depth-pass time (20.7s+45.6s of 153.4s
+# for a 240-frame clip) at the library's own internal default of 8, entirely
+# untouched by attention_slicing/TF32/cudnn.benchmark (none of which affect
+# VAE conv layers). Raising to 16 measured a real (if modest) win: encode
+# -21%, decode -13%, ~6.5% off total depth-pass wall time. 24 and 32 both
+# OOM'd on this card's existing VRAM budget (MAX_RES=768) - 16 is the
+# measured ceiling here, re-verify before raising on a different
+# MAX_RES/card.
+STAGE1_DECODE_CHUNK_SIZE="${STAGE1_DECODE_CHUNK_SIZE:-16}"
 PROCESS_LENGTH="${PROCESS_LENGTH:--1}"  # -1 = full video; set lower for a quick smoke test
 # CHUNK_OVERLAP/--chunk_overlap is accepted for CLI compatibility but ignored
 # by the script itself now - cross-chunk continuity uses window_overlap for
@@ -66,6 +85,15 @@ WINDOW_OVERLAP="${WINDOW_OVERLAP:-25}"
 # a tight card since stage 1 checkpoints every chunk (see RESUME below) - an
 # OOM only loses the in-flight chunk.
 CPU_OFFLOAD="${CPU_OFFLOAD:-None}"
+# Hardcoded True forever (see DepthCrafterDemo.__init__) - only needed on
+# hardware with no working flash/efficient-attention kernel (this project's
+# ROCm dev card). On real CUDA hardware, diffusers' fused SDPA kernel is
+# available for free and enable_attention_slicing() swaps it out for a slow
+# manual-loop SlicedAttnProcessor for nothing - same shape of bug already
+# fixed for stage 2 via CHUNKED_ATTENTION. Default True here (safe on any
+# hardware); override to False in a CUDA preset once VRAM headroom is
+# reverified with slicing off (see presets/24GB.env).
+ATTENTION_SLICING="${ATTENTION_SLICING:-True}"
 # FFV1-compressed splat store instead of raw .npy - MEASURED ~6.9x smaller
 # on a real 240-frame local store (1920x1080, anime source), verified
 # bit-exact round-trip (see splat_store.py's module docstring for the full
@@ -169,8 +197,11 @@ stage1_run() {
         --window_size="$WINDOW_SIZE" \
         --window_overlap="$WINDOW_OVERLAP" \
         --cpu_offload="$CPU_OFFLOAD" \
+        --attention_slicing="$ATTENTION_SLICING" \
         --resume="$RESUME" \
-        --compress_store="$COMPRESS_STORE"
+        --compress_store="$COMPRESS_STORE" \
+        --disp_tolerance="$DISP_TOLERANCE" \
+        --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE"
 }
 
 echo "==================================================================="
@@ -224,29 +255,17 @@ run_with_retries "Stage 2" stage2_run
 
 echo
 echo "==================================================================="
-echo "Stage 3/3: combining into side-by-side 3D"
+echo "Stage 3/3: side-by-side 3D combine - NOT run automatically"
 echo "==================================================================="
-# Reuse the exact ffmpeg command inpainting_inference.py prints - it
-# already has the fps-normalization fix (avoids the alternating-eye freeze
-# from two streams with subtly different timebases) and the setsar=2/1 tag
-# (so DAR reports doubled - e.g. 32:9 -> 64:9 - which is what makes players
-# like Kodi auto-recognize full SBS 3D) baked in, driven by this run's own
-# meta.json fps rather than recomputed here.
+# Deliberately not eval'd here (used to be) - the VAAPI hwaccel command
+# inpainting_inference.py prints is meant to be run wherever a VAAPI render
+# node actually lives (e.g. locally, not on a rented GPU box billed by the
+# hour with no VAAPI device), and burning rental time on an encode step
+# that doesn't need the rented GPU at all is just wasted money. Copy the
+# command below and run it yourself, on whichever box has /dev/dri/renderD128.
 SBS_CMD="$(grep -A1 'To combine into side-by-side 3D' "$STAGE2_LOG" | tail -1 | sed 's/^[[:space:]]*//')"
 if [[ -z "$SBS_CMD" ]]; then
     echo "Could not find the SBS ffmpeg command in $STAGE2_LOG - inpainting may have failed." >&2
     exit 1
 fi
 echo "$SBS_CMD"
-eval "$SBS_CMD"
-
-# The SBS output path is whatever inpainting_inference.py derived it to
-# be (based on splat_store_dir's basename) - pull it from the command
-# itself instead of guessing, so this stays correct if that naming ever
-# changes.
-SBS_OUT="$(grep -oE '"[^"]+"$' <<<"$SBS_CMD" | tr -d '"')"
-echo
-echo "==================================================================="
-echo "Done: $SBS_OUT"
-ffmpeg -i "$SBS_OUT" 2>&1 | grep -i "stream.*video" || true
-echo "==================================================================="

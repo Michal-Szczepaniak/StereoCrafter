@@ -471,6 +471,8 @@ def main(
     bench_iters=None,
     bench_start=0,
     dump_frames=None,
+    seed=None,
+    hole_threshold=127,
 ):
     """NOTE: --input_video_path is now --splat_store_dir - point it at the
     directory depth_splatting_inference.py wrote (warp.npy + mask.npy +
@@ -632,6 +634,16 @@ def main(
         pipeline.vae.enable_slicing()
     if enable_vae_tiling and hasattr(pipeline.vae, "enable_tiling"):
         pipeline.vae.enable_tiling()
+
+    # --seed: without this, every run draws unseeded noise (randn_tensor
+    # calls in pipelines/stereo_video_inpainting.py never received a
+    # generator), making any two runs' outputs incomparable even with
+    # identical settings - confirmed no seed was threaded through anywhere
+    # in this file before this. Only meaningful with --seed set; leave unset
+    # (None) for production runs, same nondeterministic behavior as before.
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device="cuda").manual_seed(seed)
     if chunked_attention:
         enable_chunked_attention(
             pipeline.unet, kv_chunk_size=attention_kv_chunk_size,
@@ -821,6 +833,24 @@ def main(
         warp_np = np.array(warp_store[start:end], copy=True)
         mask_np = np.array(mask_store[start:end], copy=True)
 
+        # hole_threshold: every downstream consumer (TELEA prefill's `>127`
+        # check, the pipeline's own mask_processor do_binarize at 0.5, and
+        # the final composite's mask_gate) independently re-derives "is this
+        # a hole" from the stored CONTINUOUS occlu_map at an implicit 0.5
+        # (127/255) cutoff. Measured directly on real footage: pixels at
+        # ~49% coverage (occlu_map ~117-125/255, i.e. a genuinely unstable
+        # half-and-half color blend from ForwardWarpStereo's res=res_accum/
+        # mask division) sit just BELOW that cutoff and are therefore never
+        # treated as holes anywhere downstream - the raw, numerically
+        # unstable blended color gets composited straight through untouched,
+        # producing a visible defocus/smear that no stage-2 setting
+        # (steps/CFG/work_scale/denoise_strength/vae precision) can affect,
+        # since the model's output never reaches these pixels at all.
+        # Re-binarizing HERE, once, at a tunable threshold, makes every
+        # downstream consumer agree without touching each one individually.
+        # Default 127 preserves the original (buggy-for-this-case) cutoff.
+        mask_np = np.where(mask_np > hole_threshold, 255, 0).astype(np.uint8)
+
         full_mask = torch.from_numpy(mask_np).float().unsqueeze(1) / 255.0
         if pad_bottom or pad_right:
             full_mask = F.pad(full_mask, (0, pad_right, 0, pad_bottom), mode="replicate")
@@ -940,6 +970,7 @@ def main(
                         noise_aug_strength=noise_aug_strength,
                         denoise_strength=denoise_strength,
                         num_inference_steps=num_inference_steps,
+                        generator=generator,
                     )
                     video_latents = video_latents.unsqueeze(0)
 
@@ -984,9 +1015,32 @@ def main(
 
             with phase_timer("upsample_back"):
                 if work_scale != 1.0:
+                    # BUGFIX: was interpolating to (padded_height, padded_width)
+                    # (e.g. 1088 at height=1080) instead of the true (height,
+                    # width) - gen_cropped's real content is exactly
+                    # (work_height_raw, work_width_raw), which by construction
+                    # upsamples back to exactly (height, width) at this
+                    # work_scale (e.g. 540 -> 1080 at 0.5), not the /64-rounded
+                    # padded canvas. Targeting padded_height stretched the
+                    # entire frame ~0.74% vertically before the later
+                    # replicate-padding crop truncated the excess off the
+                    # bottom - confirmed visually (precomposite dumps looked
+                    # vertically stretched vs. postcomposite, which is mostly
+                    # untouched warp/mask at the correct scale) and this
+                    # mis-scaling was very likely making the hole-boundary
+                    # seam worse, not better, whenever more pixels got
+                    # composited in from this tensor (e.g. after lowering
+                    # hole_threshold).
+                    # Upsampling straight to the real (height, width) - not
+                    # padded_height/padded_width - means generated_full is
+                    # already unpadded; the "strip the replicate-padding"
+                    # crop below is then a no-op for this tensor (its slice
+                    # bounds already match its actual size) while still doing
+                    # real work for mask_out/warp_out, which remain padded
+                    # until that shared crop runs.
                     gen_cropped = generated[:, :, :work_height_raw, :work_width_raw]
                     generated_full = F.interpolate(
-                        gen_cropped, size=(padded_height, padded_width), mode="bicubic", align_corners=False
+                        gen_cropped, size=(height, width), mode="bicubic", align_corners=False
                     ).clamp(0, 1)
                 else:
                     generated_full = generated
@@ -1007,6 +1061,21 @@ def main(
                 generated_out = generated_out[:, :, :height, :width]
                 mask_out = mask_out[:, :, :height, :width]
                 warp_out = warp_out[:, :, :height, :width]
+
+            # TEMPORARY DEBUG: dump the model's output BEFORE compositing,
+            # gated by an env var so it never affects normal runs. Used to
+            # verify whether the diffusion model's actual output (as opposed
+            # to whatever ends up on screen after the mask_gate blend below)
+            # changes with denoise_strength/vae_force_upcast at all.
+            _debug_dir = os.environ.get("DEBUG_PRECOMPOSITE_DIR")
+            if _debug_dir and len(segments) == 0:
+                os.makedirs(_debug_dir, exist_ok=True)
+                _pre_u8 = _to_uint8_rgb(generated_out)
+                for _fi, _frame in enumerate(_pre_u8):
+                    cv2.imwrite(
+                        os.path.join(_debug_dir, f"pre_{_fi:04d}.png"),
+                        cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR),
+                    )
 
             with phase_timer("composite"):
                 # The model is only conditioned on `mask` to tell it where the
@@ -1152,13 +1221,23 @@ def main(
         # Kodi doesn't auto-switch to 3D. Needs an .mkv container - mp4 has
         # no standard field for it. Pixel data is untouched either way,
         # only container/codec-level metadata.
-        print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible):")
+        # VAAPI hwaccel encode (h264_vaapi) instead of libx264 - offloads the
+        # SBS combine to the GPU's fixed-function encoder instead of a CPU
+        # x264 pass, and folds in audio/subtitle passthrough (-map 0:a?/0:s?
+        # -c:a copy -c:s copy) since the final deliverable needs those, not
+        # just picture. format=nv12,hwupload converts the filtered (software)
+        # hstack output back to a hardware surface before the VAAPI encoder,
+        # which can't consume software frames directly. Assumes a VAAPI
+        # render node at /dev/dri/renderD128 - adjust if the combine box's
+        # GPU enumerates differently.
+        print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible, VAAPI hwaccel):")
         print(
-            f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
+            f'    ffmpeg -vaapi_device /dev/dri/renderD128 -i "{src}" -i "{right_eye_path}" -filter_complex '
             f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
-            f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1" '
-            f'-c:v libx264 -pix_fmt yuv420p -crf 18 '
-            f'-metadata:s:v:0 stereo_mode=left_right "{sbs_out}"'
+            f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1,format=nv12,hwupload[v]" '
+            f'-map "[v]" -map 0:a? -map 0:s? '
+            f'-c:v h264_vaapi -qp 18 -c:a copy -c:s copy '
+            f'-metadata:s:v:0 stereo_mode=left_right -y "{sbs_out}"'
         )
         print("\n==> Or into red/cyan anaglyph (ffmpeg has a built-in filter for this):")
         print(

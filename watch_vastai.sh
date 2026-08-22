@@ -51,13 +51,14 @@
 set -euo pipefail
 
 GPU_NAME="${GPU_NAME:-RTX_4090}"
-MAX_DPH="${MAX_DPH:-0.40}"            # max $/hr COMPUTE only (dph_total excludes storage)
-MIN_RELIABILITY="${MIN_RELIABILITY:-0.99}"
-DISK_GB="${DISK_GB:-400}"             # used both for the storage estimate AND as --disk on create
+MAX_DPH="${MAX_DPH:-0.30}"            # max $/hr COMPUTE only (dph_total excludes storage)
+MIN_RELIABILITY="${MIN_RELIABILITY:-0.98}"
+DISK_GB="${DISK_GB:-120}"             # used both for the storage estimate AND as --disk on create
 POLL_SECONDS="${POLL_SECONDS:-300}"   # 5 min - vast.ai inventory doesn't churn much faster than this
 AUTO_BOOK="${AUTO_BOOK:-false}"
 STOP_AFTER_BOOK="${STOP_AFTER_BOOK:-true}"   # see caveat above before disabling
 IMAGE="${IMAGE:-pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel}"   # verify this matches what setup_rental_host.sh expects before relying on it
+NET_COST="${NET_COST:-0.005}"
 
 for bin in vastai jq notify-send; do
     command -v "$bin" >/dev/null || { echo "Missing required command: $bin" >&2; exit 1; }
@@ -70,8 +71,8 @@ echo "Watching vast.ai: gpu=$GPU_NAME dph<=\$${MAX_DPH} reliability>=$MIN_RELIAB
 echo "Ctrl+C to stop."
 
 while true; do
-    offers_json="$(vastai search offers \
-        "gpu_name=$GPU_NAME reliability2>=$MIN_RELIABILITY dph_total<=$MAX_DPH rentable=true" \
+    offers_json="$(vastai search offers --storage ${DISK_GB} -o dph_total \
+        "gpu_name=$GPU_NAME reliability>=$MIN_RELIABILITY dph_total<=$MAX_DPH rentable=true duration>=7 inet_down_cost<$NET_COST" \
         --raw 2>/dev/null || echo "[]")"
 
     while IFS= read -r offer; do
@@ -79,19 +80,14 @@ while true; do
 
         id="$(jq -r '.id' <<<"$offer")"
         dph="$(jq -r '.dph_total' <<<"$offer")"
-        storage_cost="$(jq -r '.storage_cost // 0' <<<"$offer")"   # $/GB/month
+        storage_cost="$(jq -r '.storage_total_cost // 0' <<<"$offer")"
         reliability="$(jq -r '.reliability2 // .reliability // "?"' <<<"$offer")"
+        country="$(jq -r '.geolocation' <<<"$offer")"
 
-        # storage_cost is $/GB/month in vast.ai's schema - convert to $/hr
-        # for DISK_GB and add to compute for a rough all-in estimate. This
-        # is an ESTIMATE for the notification only, not what you'll
-        # actually be billed - confirm on the real listing before renting.
-        storage_hr="$(awk -v c="$storage_cost" -v g="$DISK_GB" 'BEGIN{printf "%.4f", c*g/730}')"
-        all_in="$(awk -v a="$dph" -v b="$storage_hr" 'BEGIN{printf "%.4f", a+b}')"
 
         if ! grep -qx "$id" "$SEEN_FILE" 2>/dev/null; then
             echo "$id" >> "$SEEN_FILE"
-            msg="offer $id: \$${dph}/hr compute + ~\$${storage_hr}/hr storage(${DISK_GB}GB) ~= \$${all_in}/hr, reliability ${reliability}"
+            msg="offer $id: \$${dph}/hr, reliability ${reliability}, storage ${storage_cost}/hr, country: ${country}"
             echo "==> $msg"
 
             if [ "$AUTO_BOOK" = "true" ]; then
