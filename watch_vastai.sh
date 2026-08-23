@@ -72,7 +72,7 @@ echo "Ctrl+C to stop."
 
 while true; do
     offers_json="$(vastai search offers --storage ${DISK_GB} -o dph_total \
-        "gpu_name=$GPU_NAME reliability>=$MIN_RELIABILITY dph_total<=$MAX_DPH rentable=true duration>=7 inet_down_cost<$NET_COST" \
+        "gpu_name=$GPU_NAME reliability>=$MIN_RELIABILITY rentable=true duration>=7 inet_down_cost<$NET_COST" \
         --raw 2>/dev/null || echo "[]")"
 
     while IFS= read -r offer; do
@@ -84,10 +84,16 @@ while true; do
         reliability="$(jq -r '.reliability2 // .reliability // "?"' <<<"$offer")"
         country="$(jq -r '.geolocation' <<<"$offer")"
 
+        # dph_total is vast.ai's own per-offer field, already correctly
+        # computed - filter against it directly here instead of baking
+        # dph_total<=$MAX_DPH into the search query string above.
+        awk -v d="$dph" -v m="$MAX_DPH" 'BEGIN{exit !(d<=m)}' || continue
 
         if ! grep -qx "$id" "$SEEN_FILE" 2>/dev/null; then
             echo "$id" >> "$SEEN_FILE"
-            msg="offer $id: \$${dph}/hr, reliability ${reliability}, storage ${storage_cost}/hr, country: ${country}"
+            dph_fmt="$(awk -v d="$dph" 'BEGIN{printf "%.3f", d}')"
+            storage_cost_fmt="$(awk -v s="$storage_cost" 'BEGIN{printf "%.3f", s}')"
+            msg="offer $id: \$${dph_fmt}/hr, reliability ${reliability}, storage ${storage_cost_fmt}/hr, country: ${country}"
             echo "==> $msg"
 
             if [ "$AUTO_BOOK" = "true" ]; then
