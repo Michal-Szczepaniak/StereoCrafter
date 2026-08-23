@@ -52,6 +52,75 @@ def _format_duration(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
+def _edge_threshold_fill(depth_t, threshold, n_iters):
+    """depth_t: [T,1,H,W] tensor, LOW-RES (pre-upsample) raw depth.
+
+    Root-cause fix for the silhouette comb/notch artifact (see the whole
+    investigation this session): DepthCrafter (and every other monocular
+    depth model tested - Depth-Anything included) never outputs a genuine
+    hard edge at a real depth discontinuity, only a soft multi-pixel
+    transition band, even at its own native inference resolution (verified
+    directly on raw pixel values, independent of any upsampling/colormap).
+    Forward-splatting that soft band - especially combined with the splat
+    being completely row-independent (flow_y==0 always) - is what produces
+    the comb: real silhouettes aren't straight lines, so a soft transition
+    band's exact "effective edge" position drifts row to row.
+
+    This reverses that softness at the source, before any upsampling, via
+    a per-pass, per-pixel flood-fill re-evaluated fresh every pass against
+    each pixel's CURRENT (just-updated) value - not a one-time
+    classification:
+      - a pixel currently <= threshold takes the MIN of its 4 literal
+        attached neighbors (up/down/left/right) - but only neighbors that
+        are THEMSELVES currently above threshold count as candidates.
+        Excluding same-side neighbors is required: without it, two
+        adjacent below-threshold pixels just keep copying each other's low
+        value forever (each was always available as the other's "lowest
+        neighbor"), so genuine multi-pixel-wide transition bands never
+        close no matter how many passes run - verified directly, this is
+        not a hypothetical. If a pixel has no above-threshold neighbor at
+        all (real background, not near any edge), it just keeps its
+        current value that pass.
+      - a pixel currently > threshold takes the MAX of all 4 neighbors,
+        unconditionally - no exclusion needed on this side, since a plain
+        MAX can only ever grow the high region pass over pass, never get
+        stuck the way MIN does on a mutually-reinforcing low pair.
+
+    threshold is in the SAME units as depth_t (not normalized to [0,1]) -
+    callers pass e.g. chunk_min + frac*(chunk_max-chunk_min). n_iters
+    controls how many pixels wide a transition band this can fully close
+    (a band wider than ~n_iters low-res pixels may only partially close).
+
+    Validated end-to-end (real splat + real stage-2 inpainting, not just
+    visual inspection of the depth map) on real footage at threshold_frac
+    around 0.10-0.20 of the chunk's own range and n_iters=3, at
+    max_res=768 specifically - re-verify if used at a different max_res,
+    since the halo's absolute low-res-pixel width was measured to differ
+    between 384 and 768.
+    """
+    current = depth_t
+    for _ in range(n_iters):
+        up = F.pad(current, (0, 0, 1, 0), mode="replicate")[:, :, :-1, :]
+        down = F.pad(current, (0, 0, 0, 1), mode="replicate")[:, :, 1:, :]
+        left = F.pad(current, (1, 0, 0, 0), mode="replicate")[:, :, :, :-1]
+        right = F.pad(current, (0, 1, 0, 0), mode="replicate")[:, :, :, 1:]
+
+        neighbors = torch.stack([up, down, left, right], dim=0)
+        neighbor_is_bg = neighbors <= threshold
+
+        pos_inf = torch.finfo(neighbors.dtype).max
+        candidates = torch.where(neighbor_is_bg, torch.full_like(neighbors, pos_inf), neighbors)
+        neighbor_min_confirmed = candidates.min(dim=0).values
+        no_valid_candidate = neighbor_is_bg.all(dim=0)
+        neighbor_min_confirmed = torch.where(no_valid_candidate, current, neighbor_min_confirmed)
+
+        neighbor_max = neighbors.max(dim=0).values
+
+        is_bg = current <= threshold
+        current = torch.where(is_bg, neighbor_min_confirmed, neighbor_max)
+    return current
+
+
 class LiveProgress:
     """One continuously-updating status line covering both levels of
     progress this pass has (outer depth-chunk/ETA, and the per-batch warp
@@ -247,8 +316,16 @@ class DepthCrafterDemo:
         chunk_size: int = 110,
         resume: bool = True,
         decode_chunk_size: int = 8,
+        edge_threshold_frac: float = 0.10,
+        edge_fill_iters: int = 3,
     ):
-        """window_size/window_overlap control DepthCrafter's OWN internal
+        """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
+        applied to each chunk's raw low-res depth before upsampling (see
+        that function's own docstring for the full mechanism/rationale).
+        Validated end-to-end at frac=0.10, iters=3, max_res=768 on real
+        footage - re-verify at other max_res values.
+
+        window_size/window_overlap control DepthCrafter's OWN internal
         sliding-window inference within a single self.pipe() call - these
         must satisfy window_overlap < window_size, that's a constraint of
         the model's own windowing loop, not something we chose.
@@ -470,44 +547,26 @@ class DepthCrafterDemo:
                     "max=", np.nanmax(result),
                 )
 
-                # NEAREST (not bilinear): depth is not a color image - at a
-                # real foreground/background silhouette boundary there is no
-                # gradual gradient in reality, only a hard drop, so
-                # bilinearly blending across it manufactures fictitious
-                # intermediate depth values that correspond to no real
-                # surface. Measured directly (prior session): that fabricated
-                # soft blend is what made the exact boundary column
-                # hair-trigger unstable row-to-row during upsampling, which
-                # is what produced the dotted/wavy fringe along character
-                # silhouettes in the final splat mask/warp. nearest gives a
-                # blockier (staircase) but monotonic edge that tracks the
-                # low-res model's own (already smooth) curve exactly,
-                # instead of zigzagging.
-                #
-                # SWITCHED BACK TO BILINEAR (this session, current status):
-                # seed-controlled A/B testing (fixed --seed across runs, so
-                # only the stage-1 pipeline differs) on a fine/jagged edge
-                # (a character's hair against a busy background) showed
-                # nearest produces visible speckle there that survives all
-                # the way into the final stage-2 painted output, while
-                # bilinear is clean on that same seed - i.e. the row-to-row
-                # jitter nearest was chosen to fix is a real but SEPARATE
-                # problem from DepthCrafter's own per-pixel noise on fine
-                # texture, which bilinear's smoothing actually helps with
-                # and nearest's exact block-preservation faithfully
-                # reproduces as visible noise. Re-enabling crack-closing or
-                # changing window_size did NOT fix the speckle with nearest -
-                # only switching to bilinear did, isolated one variable at a
-                # time. NOTE: a separate defect (a jagged notch on one large,
-                # simple silhouette edge) was measured to persist under
-                # BOTH nearest and bilinear - this switch does not fix that
-                # one, it's still an open problem.
+                # ROOT-CAUSE FIX for the silhouette comb/notch artifact (see
+                # _edge_threshold_fill's own docstring for the full
+                # mechanism). Earlier attempts in this same investigation
+                # (nearest vs bilinear upsampling, crack-closing, z-buffer
+                # splat, plain depth-map sharpening/dilation) were all
+                # symptom-side patches on top of an unmodified soft depth
+                # signal, and none of them fixed it - it's present
+                # identically in upstream's own unmodified
+                # camel_splatting_results.jpg demo asset. This instead
+                # reverses the depth model's own soft-edge output at the
+                # source, on the raw low-res chunk, before any upsampling -
+                # validated end-to-end (real splat + real stage-2
+                # inpainting) on real footage, not just visual inspection.
                 tensor_res = torch.from_numpy(result).unsqueeze(1).float().cuda()
+                edge_threshold = tensor_res.min() + edge_threshold_frac * (tensor_res.max() - tensor_res.min())
+                tensor_res = _edge_threshold_fill(tensor_res, edge_threshold, edge_fill_iters)
                 result = F.interpolate(
                     tensor_res,
                     size=(original_height, original_width),
-                    mode="bilinear",
-                    align_corners=False,
+                    mode="nearest",
                 )
                 result = result[:, 0].cpu().numpy()
 
@@ -797,23 +856,17 @@ class ForwardWarpStereo(nn.Module):
         else:
             res, occlu_map = self._forward_legacy_cuda_splat(im, disp)
 
-        # RE-ENABLED at crack_radius=2 (this session): a prior session
-        # disabled this entirely after finding crack_radius=8 swallowed
-        # genuine 1-5px disocclusion holes on one clip. But seed-controlled
-        # A/B testing this session found the opposite problem at radius=2
-        # OFF: DepthCrafter's own per-pixel noise on fine/jagged silhouettes
-        # (hair strands specifically) survives as a visible dithered/
-        # checkered stipple along the whole boundary, in the actual final
-        # stage-2 painted output, not just the raw mask - confirmed at full
-        # production scale (max_res=768, real flash attention) on a rented
-        # 4090. Bilinear upsampling alone did not fix it; crack_radius=2
-        # (not 8) alongside bilinear did, isolated one variable at a time.
-        # Radius=2 is intentionally the ORIGINAL (smaller) default, not the
-        # 8 that caused the swallowing problem elsewhere - has NOT yet been
-        # re-verified against that original large-disocclusion-swallowing
-        # scenario on this content; if genuine holes start disappearing
-        # again, that's the first thing to re-check.
-        res, occlu_map = self._close_cracks(res, occlu_map)
+        # DISABLED: _close_cracks doesn't exist in upstream StereoCrafter at
+        # all (added later, this project's own "Optimizations" commit) - and
+        # the silhouette comb/notch artifact this whole investigation was
+        # chasing is present identically in upstream's own unmodified demo
+        # output, so it isn't something this post-process was ever fixing.
+        # Various crack_radius values were tried (2, 4, 8) across sessions -
+        # each one just traded which holes got swallowed vs left alone
+        # (crack_radius=8 was measured to swallow genuine 1-5px disocclusion
+        # holes on one clip). Disabled entirely to match upstream's actual
+        # behavior instead of stacking unproven tweaks on top of it.
+        # res, occlu_map = self._close_cracks(res, occlu_map)
 
         if not self.occlu_map:
             return res
@@ -903,23 +956,13 @@ def DepthSplatting(
     print(f"==> writing splat store to: {store_dir}")
     print(f"==> ({num_frames} x {height} x {width}) warp uint8 + mask uint8, no grid, no depth-vis")
 
-    # crack_radius=4 (kernel width 9), up from the class default of 2: measured
-    # directly off a real splat store (see conversation/PR history), a fast
-    # zoom/pan frame with a steep near-vertical depth discontinuity produced
-    # 336 of 358 hole runs at EXACTLY 5px wide - precisely the width of the
-    # default radius=2 opening kernel (k=2*radius+1=5). A run exactly as wide
-    # as the opening's structuring element survives erosion+dilate untouched,
-    # so these were misclassified as genuine disocclusions and left
-    # unpatched, producing a visible speckled/dotted fringe in both the raw
-    # warp and the final inpainted output (confirmed identical in both -
-    # this is a stage-1 splatting artifact, not a stage-2 inpainting one).
-    # radius=4 (k=9) closes runs up to 8px, comfortably below the
-    # class docstring's own measured >10px real-hole threshold, so genuine
-    # disocclusions are unaffected.
-    # REVERTED (prior session's z-buffer splat did not fix the reported
-    # defect - see ForwardWarpStereo docstring/_zbuffer_splat for the
-    # postmortem) - back to the original legacy CUDA blend path in
-    # production while the real cause is re-investigated.
+    # use_zbuffer_splat=False: matches upstream's original legacy CUDA blend
+    # path (see ForwardWarpStereo._forward_legacy_cuda_splat). The z-buffer
+    # splat was a local addition that did not fix the silhouette comb/notch
+    # artifact this was investigated for - see _zbuffer_splat's docstring
+    # for the postmortem. crack_radius/disp_tolerance are inert with
+    # _close_cracks disabled and use_zbuffer_splat=False respectively; left
+    # at their defaults rather than removed from the signature.
     stereo_projector = ForwardWarpStereo(
         occlu_map=True, crack_radius=2, disp_tolerance=disp_tolerance, use_zbuffer_splat=False
     ).cuda()
@@ -1078,6 +1121,8 @@ def main(
     compress_store: bool = True,
     disp_tolerance: float = 1.0,
     decode_chunk_size: int = 8,
+    edge_threshold_frac: float = 0.10,
+    edge_fill_iters: int = 3,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -1091,6 +1136,12 @@ def main(
     chunk boundary exactly like DepthCrafter's own internal window
     transitions. window_overlap MUST be less than window_size - that's the
     model's own internal windowing constraint.
+
+    edge_threshold_frac/edge_fill_iters: tune the silhouette comb/notch
+    fix (see _edge_threshold_fill's docstring). These are very likely
+    content-dependent - different anime episodes have different amounts
+    of contrast/detail at silhouette edges - re-tune per-episode rather
+    than assuming the validated defaults (0.10, 3) transfer directly.
 
     resume: continue a previous run's depth pass from its checkpoint under
     {output_dir}/.depth_checkpoint if the parameters match (see
@@ -1119,6 +1170,8 @@ def main(
         "guidance_scale": guidance_scale,
         "disp_tolerance": disp_tolerance,
         "decode_chunk_size": decode_chunk_size,
+        "edge_threshold_frac": edge_threshold_frac,
+        "edge_fill_iters": edge_fill_iters,
     }
     if resume and _store_is_complete(output_dir, store_params):
         print(f"==> Stage 1 already complete for these params - reusing existing store at {output_dir}")
@@ -1155,6 +1208,8 @@ def main(
         guidance_scale=guidance_scale,
         resume=resume,
         decode_chunk_size=decode_chunk_size,
+        edge_threshold_frac=edge_threshold_frac,
+        edge_fill_iters=edge_fill_iters,
     )
 
     try:

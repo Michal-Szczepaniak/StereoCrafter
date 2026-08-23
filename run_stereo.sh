@@ -101,6 +101,14 @@ ATTENTION_SLICING="${ATTENTION_SLICING:-True}"
 # to stage 2's per-iteration diffusion cost. Set False to fall back to the
 # original uncompressed format.
 COMPRESS_STORE="${COMPRESS_STORE:-True}"
+# Silhouette comb/notch artifact fix (see _edge_threshold_fill's docstring
+# in depth_splatting_inference.py for the full mechanism) - reverses the
+# depth model's own soft-edge output before upsampling. Validated at these
+# defaults on real footage at MAX_RES=768 specifically - likely needs
+# re-tuning per anime episode (different silhouette contrast/detail) and
+# re-verifying at other MAX_RES values.
+EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
+EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 
 # ---- stage 2 (inpainting) knobs - these fit a 12GB card at 1080p; going
 # below tile_num=4, or raising decode_latents_chunk_size above 1, OOM at
@@ -135,6 +143,13 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-8}"
 WORK_SCALE="${WORK_SCALE:-1.0}"
 DENOISE_STRENGTH="${DENOISE_STRENGTH:-1.0}"
 MASK_SKIP_THRESHOLD="${MASK_SKIP_THRESHOLD:-}"
+# CLASSICAL_ONLY: skip the SVD diffusion model in stage 2 entirely (never
+# loaded, no VRAM/time cost) - output is just cv2.inpaint(TELEA) over the
+# splat holes. Only makes sense once stage 1's silhouette fix
+# (EDGE_THRESHOLD_FRAC/EDGE_FILL_ITERS) has shrunk holes down to their small,
+# mostly-background size; confirmed visually indistinguishable from full
+# diffusion on isolated frame tests, not yet verified on a full episode.
+CLASSICAL_ONLY="${CLASSICAL_ONLY:-False}"
 AGGRESSIVE_FREE="${AGGRESSIVE_FREE:-False}"
 VAE_FORCE_UPCAST="${VAE_FORCE_UPCAST:-False}"
 COMPILE_UNET="${COMPILE_UNET:-False}"
@@ -201,7 +216,9 @@ stage1_run() {
         --resume="$RESUME" \
         --compress_store="$COMPRESS_STORE" \
         --disp_tolerance="$DISP_TOLERANCE" \
-        --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE"
+        --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
+        --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
+        --edge_fill_iters="$EDGE_FILL_ITERS"
 }
 
 echo "==================================================================="
@@ -242,6 +259,7 @@ stage2_run() {
         --aggressive_free="$AGGRESSIVE_FREE" \
         --vae_force_upcast="$VAE_FORCE_UPCAST" \
         --compile_unet="$COMPILE_UNET" \
+        --classical_only="$CLASSICAL_ONLY" \
         "${MASK_SKIP_ARG[@]}" \
         --chunked_attention="$CHUNKED_ATTENTION" \
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \

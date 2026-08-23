@@ -459,6 +459,7 @@ def main(
     denoise_strength=1.0,
     work_scale=1.0,
     mask_skip_threshold=None,
+    classical_only=False,
     max_iters=None,
     prefill_occlusion=True,
     resume=True,
@@ -554,6 +555,20 @@ def main(
     (default) disables this - off unless explicitly requested, since it's
     unverified against real footage.
 
+    classical_only: skip the SVD diffusion model for every chunk, not just
+    ones under mask_skip_threshold - the whole pipeline (image_encoder,
+    vae, unet) is never even loaded, so this also skips the model-load time
+    and VRAM. Output is just prefill_occlusion's cv2.inpaint(TELEA) result
+    (prefill_occlusion must stay True - forced on if it's off). Only makes
+    sense once the depth-splatting stage's silhouette fix
+    (edge_threshold_frac/edge_fill_iters in depth_splatting_inference.py)
+    has shrunk holes down to their small, mostly-background-only size - on
+    older/unfixed splat stores with wide comb-artifact holes this will look
+    much worse than the diffusion path. Confirmed visually indistinguishable
+    from the full diffusion output on isolated single-frame tests after that
+    fix (gintama, opening) - not yet verified across a full multi-frame
+    episode. Off by default.
+
     denoise_strength: SDEdit/img2img-style partial denoising - starts the
     scheduler partway through its schedule from the prefilled warp's own VAE
     encoding (already computed for the channel-concat conditioning, so this
@@ -587,95 +602,100 @@ def main(
     frames as PNGs to DIR, so different configs can be compared frame-for-
     frame (works with or without --bench_iters).
     """
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        pre_trained_path, subfolder="image_encoder", variant="fp16", torch_dtype=torch.float16
-    )
-    vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path, subfolder="vae", variant="fp16", torch_dtype=torch.float16
-    )
-    unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        unet_path, subfolder="unet_diffusers", low_cpu_mem_usage=True, torch_dtype=torch.float16
-    )
+    if classical_only:
+        prefill_occlusion = True
 
-    image_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
-
-    # OPTIMIZATION: the VAE ships force_upcast=True (fp16 -> fp32 -> fp16 on
-    # every single tile call, see needs_upcasting in
-    # pipelines/stereo_video_inpainting.py). Overriding it here runs the VAE
-    # fully in fp16 - escape hatch is vae_force_upcast=True if that ever
-    # shows visible NaNs/artifacts on real footage.
-    vae.config.force_upcast = vae_force_upcast
-
-    pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
-        pre_trained_path,
-        image_encoder=image_encoder,
-        vae=vae,
-        unet=unet,
-        torch_dtype=torch.float16,
-    )
-
-    # diffusers' own per-call tqdm bar would otherwise print a fresh
-    # 0/num_inference_steps bar for every one of tile_num^2 tiles - replaced
-    # by LiveProgress's single status line (fed via callback_on_step_end,
-    # see spatial_tiled_process) instead.
-    pipeline.set_progress_bar_config(disable=True)
-
-    # OPTIMIZATION (VRAM): these are cheap opt-ins if you're still tight on GPU
-    # memory after the RAM fix below. cpu offload trades speed for VRAM.
-    if enable_sequential_cpu_offload:
-        pipeline.enable_sequential_cpu_offload()
-    elif enable_model_cpu_offload:
-        pipeline.enable_model_cpu_offload()
-    else:
-        pipeline = pipeline.to("cuda")
-    if enable_vae_slicing and hasattr(pipeline.vae, "enable_slicing"):
-        pipeline.vae.enable_slicing()
-    if enable_vae_tiling and hasattr(pipeline.vae, "enable_tiling"):
-        pipeline.vae.enable_tiling()
-
-    # --seed: without this, every run draws unseeded noise (randn_tensor
-    # calls in pipelines/stereo_video_inpainting.py never received a
-    # generator), making any two runs' outputs incomparable even with
-    # identical settings - confirmed no seed was threaded through anywhere
-    # in this file before this. Only meaningful with --seed set; leave unset
-    # (None) for production runs, same nondeterministic behavior as before.
+    pipeline = None
     generator = None
-    if seed is not None:
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-    if chunked_attention:
-        enable_chunked_attention(
-            pipeline.unet, kv_chunk_size=attention_kv_chunk_size,
-            suppress_probe_warnings=suppress_attention_kernel_warnings,
+    if not classical_only:
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            pre_trained_path, subfolder="image_encoder", variant="fp16", torch_dtype=torch.float16
         )
-        enable_chunked_attention(
-            pipeline.vae, kv_chunk_size=attention_kv_chunk_size,
-            suppress_probe_warnings=suppress_attention_kernel_warnings,
+        vae = AutoencoderKLTemporalDecoder.from_pretrained(
+            pre_trained_path, subfolder="vae", variant="fp16", torch_dtype=torch.float16
         )
-    # Read by decode_latents_streaming (pipelines/stereo_video_inpainting.py)
-    # to gate its own per-decode-chunk torch.cuda.empty_cache() - see
-    # aggressive_free's docstring above.
-    pipeline._aggressive_free = aggressive_free
+        unet = UNetSpatioTemporalConditionModel.from_pretrained(
+            unet_path, subfolder="unet_diffusers", low_cpu_mem_usage=True, torch_dtype=torch.float16
+        )
 
-    if compile_unet:
-        # NOTE: torch.compile() itself never raises - compilation is lazy and
-        # actually happens (and can fail) on the FIRST FORWARD PASS, deep
-        # inside the denoising loop, so a try/except around the wrap call
-        # below catches nothing (confirmed empirically: this crashed with
-        # "torch._inductor.exc.TritonMissing" from inside
-        # pipelines/stereo_video_inpainting.py's unet() call, not here).
-        # inductor's default backend needs triton - check for it up front
-        # instead of pretending the try/except protects anything.
-        import importlib.util
+        image_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+        unet.requires_grad_(False)
 
-        if importlib.util.find_spec("triton") is None:
-            print(
-                "==> compile_unet requested but triton isn't installed (torch.compile's "
-                "default inductor backend needs it) - continuing uncompiled."
-            )
+        # OPTIMIZATION: the VAE ships force_upcast=True (fp16 -> fp32 -> fp16 on
+        # every single tile call, see needs_upcasting in
+        # pipelines/stereo_video_inpainting.py). Overriding it here runs the VAE
+        # fully in fp16 - escape hatch is vae_force_upcast=True if that ever
+        # shows visible NaNs/artifacts on real footage.
+        vae.config.force_upcast = vae_force_upcast
+
+        pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
+            pre_trained_path,
+            image_encoder=image_encoder,
+            vae=vae,
+            unet=unet,
+            torch_dtype=torch.float16,
+        )
+
+        # diffusers' own per-call tqdm bar would otherwise print a fresh
+        # 0/num_inference_steps bar for every one of tile_num^2 tiles - replaced
+        # by LiveProgress's single status line (fed via callback_on_step_end,
+        # see spatial_tiled_process) instead.
+        pipeline.set_progress_bar_config(disable=True)
+
+        # OPTIMIZATION (VRAM): these are cheap opt-ins if you're still tight on GPU
+        # memory after the RAM fix below. cpu offload trades speed for VRAM.
+        if enable_sequential_cpu_offload:
+            pipeline.enable_sequential_cpu_offload()
+        elif enable_model_cpu_offload:
+            pipeline.enable_model_cpu_offload()
         else:
-            pipeline.unet = torch.compile(pipeline.unet, dynamic=False)
+            pipeline = pipeline.to("cuda")
+        if enable_vae_slicing and hasattr(pipeline.vae, "enable_slicing"):
+            pipeline.vae.enable_slicing()
+        if enable_vae_tiling and hasattr(pipeline.vae, "enable_tiling"):
+            pipeline.vae.enable_tiling()
+
+        # --seed: without this, every run draws unseeded noise (randn_tensor
+        # calls in pipelines/stereo_video_inpainting.py never received a
+        # generator), making any two runs' outputs incomparable even with
+        # identical settings - confirmed no seed was threaded through anywhere
+        # in this file before this. Only meaningful with --seed set; leave unset
+        # (None) for production runs, same nondeterministic behavior as before.
+        if seed is not None:
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+        if chunked_attention:
+            enable_chunked_attention(
+                pipeline.unet, kv_chunk_size=attention_kv_chunk_size,
+                suppress_probe_warnings=suppress_attention_kernel_warnings,
+            )
+            enable_chunked_attention(
+                pipeline.vae, kv_chunk_size=attention_kv_chunk_size,
+                suppress_probe_warnings=suppress_attention_kernel_warnings,
+            )
+        # Read by decode_latents_streaming (pipelines/stereo_video_inpainting.py)
+        # to gate its own per-decode-chunk torch.cuda.empty_cache() - see
+        # aggressive_free's docstring above.
+        pipeline._aggressive_free = aggressive_free
+
+        if compile_unet:
+            # NOTE: torch.compile() itself never raises - compilation is lazy and
+            # actually happens (and can fail) on the FIRST FORWARD PASS, deep
+            # inside the denoising loop, so a try/except around the wrap call
+            # below catches nothing (confirmed empirically: this crashed with
+            # "torch._inductor.exc.TritonMissing" from inside
+            # pipelines/stereo_video_inpainting.py's unet() call, not here).
+            # inductor's default backend needs triton - check for it up front
+            # instead of pretending the try/except protects anything.
+            import importlib.util
+
+            if importlib.util.find_spec("triton") is None:
+                print(
+                    "==> compile_unet requested but triton isn't installed (torch.compile's "
+                    "default inductor backend needs it) - continuing uncompiled."
+                )
+            else:
+                pipeline.unet = torch.compile(pipeline.unet, dynamic=False)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -735,6 +755,7 @@ def main(
         "denoise_strength": denoise_strength,
         "work_scale": work_scale,
         "mask_skip_threshold": mask_skip_threshold,
+        "classical_only": classical_only,
         "prefill_occlusion": prefill_occlusion,
         "vae_encode_chunk_size": vae_encode_chunk_size,
         "num_frames": num_frames,
@@ -944,7 +965,7 @@ def main(
                         f"input_frames_i: {input_frames_i.shape}, generated: {generated.shape}"
                     )
 
-            skip_diffusion = (
+            skip_diffusion = classical_only or (
                 mask_skip_threshold is not None
                 and model_mask_i.max().item() < mask_skip_threshold
             )

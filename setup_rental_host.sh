@@ -25,7 +25,6 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 : "${HF_TOKEN:?Set HF_TOKEN to a Hugging Face read token first (needed for the gated SVD weights) - see the header comment above.}"
-: "${HF_USERNAME:?Set HF_USERNAME to your Hugging Face username first.}"
 
 echo "==================================================================="
 echo "1/5: Forward-Warp - swap ROCm/HIP build files back to CUDA"
@@ -190,20 +189,32 @@ echo
 echo "==================================================================="
 echo "5/5: model weights"
 echo "==================================================================="
+# OPTIMIZATION: plain `git lfs clone` was the slowest step of this whole
+# script on a rental box - git-lfs downloads one file at a time over a
+# single connection. huggingface_hub's snapshot_download with
+# HF_HUB_ENABLE_HF_TRANSFER=1 (hf_transfer: a Rust-backed downloader,
+# many parallel connections per file) is dramatically faster on a
+# well-connected host. Only needs HF_TOKEN (for the gated SVD repo) - no
+# HF_USERNAME/basic-auth git URL needed anymore.
+pip install -q "huggingface_hub[hf_transfer]"
 mkdir -p weights
-cd weights
-git lfs install
+HF_HUB_ENABLE_HF_TRANSFER=1 python -c "
+import os
+from huggingface_hub import snapshot_download
 
-if [[ ! -d stable-video-diffusion-img2vid-xt-1-1 ]]; then
-    git clone "https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1"
-fi
-if [[ ! -d DepthCrafter ]]; then
-    git clone https://huggingface.co/tencent/DepthCrafter
-fi
-if [[ ! -d StereoCrafter ]]; then
-    git clone https://huggingface.co/TencentARC/StereoCrafter
-fi
-cd ..
+token = os.environ['HF_TOKEN']
+targets = [
+    ('stabilityai/stable-video-diffusion-img2vid-xt-1-1', 'weights/stable-video-diffusion-img2vid-xt-1-1'),
+    ('tencent/DepthCrafter', 'weights/DepthCrafter'),
+    ('TencentARC/StereoCrafter', 'weights/StereoCrafter'),
+]
+for repo_id, local_dir in targets:
+    if os.path.isdir(local_dir):
+        print(f'==> {local_dir} already exists - skipping')
+        continue
+    print(f'==> downloading {repo_id} -> {local_dir}')
+    snapshot_download(repo_id=repo_id, local_dir=local_dir, token=token)
+"
 
 echo
 echo "==================================================================="
