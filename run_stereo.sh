@@ -149,7 +149,7 @@ MASK_SKIP_THRESHOLD="${MASK_SKIP_THRESHOLD:-}"
 # (EDGE_THRESHOLD_FRAC/EDGE_FILL_ITERS) has shrunk holes down to their small,
 # mostly-background size; confirmed visually indistinguishable from full
 # diffusion on isolated frame tests, not yet verified on a full episode.
-CLASSICAL_ONLY="${CLASSICAL_ONLY:-False}"
+CLASSICAL_ONLY="${CLASSICAL_ONLY:-True}"
 AGGRESSIVE_FREE="${AGGRESSIVE_FREE:-False}"
 VAE_FORCE_UPCAST="${VAE_FORCE_UPCAST:-False}"
 COMPILE_UNET="${COMPILE_UNET:-False}"

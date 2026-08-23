@@ -123,41 +123,54 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
 
 class LiveProgress:
     """One continuously-updating status line covering both levels of
-    progress this pass has (outer depth-chunk/ETA, and the per-batch warp
-    call within it) instead of two separate noisy print streams - the
-    outer "Splatting chunk i/N" print and one line per batch. Redraws in
-    place via \\r; only commits a real newline once per outer chunk
-    (finish_chunk), so nothing scrolls except one line per chunk.
+    progress a pass has (outer chunk/ETA, and a per-chunk sub-level)
+    instead of separate noisy print streams. Redraws in place via \\r;
+    only commits a real newline once per outer chunk (finish_chunk), so
+    nothing scrolls except one line per chunk.
 
-    1:1 port of inpainting_inference.py's LiveProgress (same header/ETA
-    mechanics) - the only difference is the sub-level: splatting has no
-    per-tile denoising steps, so the sub-level here is the per-batch warp
-    call instead of tile/step."""
+    Shared by both passes in this file, each with its own sub-level:
+    DepthCrafterDemo.infer()'s depth-inference pass uses set_step (the
+    denoising step within self.pipe(), fed via callback_on_step_end -
+    same idea as inpainting_inference.py's own LiveProgress/tile-step
+    mechanics), DepthSplatting's forward-warp pass uses set_batch (no
+    denoising steps of its own, just the per-batch warp call)."""
 
-    def __init__(self, num_frames: int, total_chunks: int):
+    def __init__(self, num_frames: int, total_chunks: int, label: str = "Splatting"):
         self.num_frames = num_frames
         self.total_chunks = total_chunks
+        self.label = label
         self._header = ""
         self._batch_idx = 0
         self._batch_total = 0
+        self._step = 0
+        self._num_steps = 0
         self._last_len = 0
 
     def set_header(self, frame_offset, chunk_index, chunk_frames, timing_str):
         self._header = (
-            f"Splatting: {frame_offset}/{self.num_frames} "
+            f"{self.label}: {frame_offset}/{self.num_frames} "
             f"(chunk {chunk_index}/{self.total_chunks}, {chunk_frames} frames){timing_str}"
         )
-        self._batch_idx = self._batch_total = 0
+        self._batch_idx = self._batch_total = self._step = self._num_steps = 0
         self._render()
 
     def set_batch(self, batch_idx: int, batch_total: int):
         self._batch_idx, self._batch_total = batch_idx, batch_total
         self._render()
 
+    def set_step(self, step: int, num_steps: int):
+        """Sub-level used by DepthCrafterDemo.infer()'s self.pipe() call, fed
+        via callback_on_step_end - the denoising-step analogue of set_batch
+        (splatting's per-batch warp call has no denoising steps of its own)."""
+        self._step, self._num_steps = step, num_steps
+        self._render()
+
     def _render(self):
         line = self._header
         if self._batch_total:
             line += f" | batch {self._batch_idx}/{self._batch_total}"
+        if self._num_steps:
+            line += f" | step {self._step}/{self._num_steps}"
         pad = max(self._last_len - len(line), 0)
         sys.stdout.write("\r" + line + " " * pad)
         sys.stdout.flush()
@@ -290,6 +303,14 @@ class DepthCrafterDemo:
             self.pipe.to("cuda")
         if attention_slicing:
             self.pipe.enable_attention_slicing()
+
+        # diffusers' own per-window tqdm bar (a fresh 0/num_denoising_steps
+        # bar restarting for every one of DepthCrafter's internal windows)
+        # otherwise floods the log - infer()'s own LiveProgress (fed via
+        # callback_on_step_end) replaces it with a single redrawing line,
+        # same treatment inpainting_inference.py already gives its own
+        # diffusion calls.
+        self.pipe.set_progress_bar_config(disable=True)
 
     def infer(
         self,
@@ -481,6 +502,15 @@ class DepthCrafterDemo:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print("==> depth checkpoint directory:", checkpoint_dir)
 
+        # OPTIMIZATION: same rolling-average chunk-time ETA as DepthSplatting's
+        # own LiveProgress below, ported here so the (much longer) depth-
+        # inference pass gets the same single-line status instead of just
+        # diffusers' own now-silenced per-window tqdm bar.
+        total_chunks = -(-total_frames // chunk_size)  # ceil div
+        chunk_durations = []
+        chunk_start = None
+        progress = LiveProgress(total_frames, total_chunks, label="Depth")
+
         def save_checkpoint():
             tmp_path = manifest_path + ".tmp"
             with open(tmp_path, "w") as f:
@@ -518,6 +548,28 @@ class DepthCrafterDemo:
                     "RAM input:", f"{frames.nbytes / 1024**2:.1f} MiB",
                 )
 
+                chunk_num = output_start // chunk_size
+                if chunk_start is not None:
+                    chunk_durations.append(time.monotonic() - chunk_start)
+                chunk_start = time.monotonic()
+
+                if chunk_durations:
+                    avg_chunk_time = sum(chunk_durations) / len(chunk_durations)
+                    last_chunk_time = chunk_durations[-1]
+                    remaining_chunks = max(total_chunks - chunk_num, 0)
+                    eta = _format_duration(avg_chunk_time * remaining_chunks)
+                    timing_str = (
+                        f", last_chunk {last_chunk_time:.1f}s, avg_chunk {avg_chunk_time:.1f}s, "
+                        f"ETA {eta}"
+                    )
+                else:
+                    timing_str = ""
+                progress.set_header(output_start, chunk_num + 1, input_end - input_start, timing_str)
+
+                def _progress_step_callback(pipe, step, timestep, callback_kwargs):
+                    progress.set_step(step + 1, num_denoising_steps)
+                    return callback_kwargs
+
                 with torch.inference_mode():
                     result = self.pipe(
                         frames,
@@ -531,7 +583,10 @@ class DepthCrafterDemo:
                         track_time=track_time,
                         carry_latents=prev_tail_latents,
                         decode_chunk_size=decode_chunk_size,
+                        callback_on_step_end=_progress_step_callback,
                     ).frames[0]
+
+                progress.finish_chunk()
 
                 # Stash this call's tail latents (already crossfaded/continuous by
                 # construction) for the *next* chunk's carry_latents, before doing
