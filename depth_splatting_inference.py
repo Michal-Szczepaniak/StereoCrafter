@@ -1,3 +1,4 @@
+import concurrent.futures
 import gc
 import json
 import os
@@ -511,42 +512,89 @@ class DepthCrafterDemo:
         chunk_start = None
         progress = LiveProgress(total_frames, total_chunks, label="Depth")
 
-        def save_checkpoint():
+        def save_checkpoint(output_start_snap, chunk_files_snap, chunk_meta_snap, global_min_snap, global_max_snap):
             tmp_path = manifest_path + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(
                     {
                         "params": run_params,
-                        "output_start": output_start,
-                        "chunk_files": [os.path.basename(p) for p in chunk_files],
-                        "chunk_meta": chunk_meta,
-                        "global_min": float(global_min),
-                        "global_max": float(global_max),
+                        "output_start": output_start_snap,
+                        "chunk_files": [os.path.basename(p) for p in chunk_files_snap],
+                        "chunk_meta": chunk_meta_snap,
+                        "global_min": float(global_min_snap),
+                        "global_max": float(global_max_snap),
                     },
                     f,
                 )
             os.replace(tmp_path, manifest_path)
 
+        def _write_chunk_behind(quantized, chunk_path, latents_cpu, output_start_snap,
+                                 chunk_files_snap, chunk_meta_snap, global_min_snap, global_max_snap):
+            """Runs on write_executor - the FFV1 encode + latent/manifest
+            writes for a chunk that already finished on the GPU, while the
+            main thread has already moved on to the *next* chunk's
+            self.pipe() call. Takes explicit snapshots (not the live
+            chunk_files/chunk_meta/output_start) since those keep mutating
+            on the main thread while this runs in the background."""
+            ffv1_encode(quantized, chunk_path, "gray16le", original_width, original_height)
+            if latents_cpu is not None:
+                torch.save(latents_cpu, latents_path)
+            save_checkpoint(output_start_snap, chunk_files_snap, chunk_meta_snap, global_min_snap, global_max_snap)
+
+        def _next_chunk_range(start):
+            if start == 0:
+                in_start = 0
+            else:
+                in_start = max(0, start - window_overlap)
+            in_end = min(start + chunk_size, total_frames)
+            return in_start, in_end
+
+        # OPTIMIZATION: self.pipe() (GPU) and the per-chunk CPU/disk work
+        # (decord read of the next chunk, FFV1 encode + manifest write of
+        # the chunk that just finished) were fully serialized - the GPU sat
+        # idle during the latter and the CPU sat idle during the former,
+        # even though a rental box has plenty of otherwise-unused cores for
+        # this. Two single-worker pools double-buffer both directions;
+        # `.result()` on the *previous* read/write future (not the one just
+        # submitted) bounds outstanding work to one chunk, which is what
+        # keeps this safe for the checkpoint/resume logic below - read/
+        # encode take low tens of seconds vs. self.pipe()'s minutes, so that
+        # wait is expected to return immediately in practice, not actually
+        # block.
+        read_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="depth-read")
+        write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="depth-write")
+        pending_write_future = None
+
+        in_start, in_end = _next_chunk_range(output_start)
+        pending_read_future = read_executor.submit(read_video_chunk_streaming, vid, in_start, in_end, stride)
+
         try:
             while output_start < total_frames:
-                if output_start == 0:
-                    input_start = 0
-                else:
-                    input_start = max(0, output_start - window_overlap)
-
-                input_end = min(output_start + chunk_size, total_frames)
+                input_start, input_end = in_start, in_end
 
                 print(
                     f"\n==> DepthCrafter chunk: input {input_start}:{input_end}, "
                     f"output starting at {output_start}"
                 )
 
-                frames = read_video_chunk_streaming(vid, input_start, input_end, stride)
+                frames = pending_read_future.result()
 
                 print(
                     "    chunk shape:", frames.shape,
                     "RAM input:", f"{frames.nbytes / 1024**2:.1f} MiB",
                 )
+
+                # Kick off the NEXT chunk's frame read now, so decord decodes
+                # it on read_executor while self.pipe() below runs on the GPU,
+                # instead of after it.
+                next_output_start = output_start + chunk_size
+                if next_output_start < total_frames:
+                    in_start, in_end = _next_chunk_range(next_output_start)
+                    pending_read_future = read_executor.submit(
+                        read_video_chunk_streaming, vid, in_start, in_end, stride
+                    )
+                else:
+                    pending_read_future = None
 
                 chunk_num = output_start // chunk_size
                 if chunk_start is not None:
@@ -590,8 +638,13 @@ class DepthCrafterDemo:
 
                 # Stash this call's tail latents (already crossfaded/continuous by
                 # construction) for the *next* chunk's carry_latents, before doing
-                # any further per-chunk processing below.
+                # any further per-chunk processing below. A small CPU copy is
+                # also taken here (window_overlap-sized, cheap) for the
+                # write-behind task below - keeps that background thread from
+                # touching a live CUDA tensor while this thread is off running
+                # self.pipe() for the next chunk.
                 prev_tail_latents = self.pipe.last_tail_latents
+                prev_tail_latents_cpu = prev_tail_latents.cpu() if prev_tail_latents is not None else None
 
                 result = result.sum(-1) / result.shape[-1]
 
@@ -660,24 +713,37 @@ class DepthCrafterDemo:
                 chunk_path = os.path.join(checkpoint_dir, f"depth_{len(chunk_files):06d}.mkv")
                 chunk_range = max(float(chunk_max) - float(chunk_min), 1e-12)
                 quantized = np.round((result - chunk_min) / chunk_range * DEPTH_QUANT_LEVELS).astype(np.uint16)
-                ffv1_encode(quantized, chunk_path, "gray16le", original_width, original_height)
                 chunk_files.append(chunk_path)
                 chunk_meta.append({
                     "min": float(chunk_min), "max": float(chunk_max), "frames": int(result.shape[0]),
                 })
-                if prev_tail_latents is not None:
-                    torch.save(prev_tail_latents, latents_path)
 
                 print(f"    saved {result.shape[0]} frames -> {chunk_path}")
                 print(f"    chunk depth range: {chunk_min:.6f} .. {chunk_max:.6f}")
                 print(f"    global depth range: {global_min:.6f} .. {global_max:.6f}")
 
+                output_start += chunk_size
+
+                # Write-behind: the actual FFV1 encode + latent/manifest disk
+                # writes for THIS chunk run on write_executor while the main
+                # thread moves on to the NEXT chunk's self.pipe() call.
+                # Waiting on the *previous* chunk's write here (not this
+                # one) bounds outstanding writes to one - see header comment
+                # above for why that wait is expected to be a no-op.
+                if pending_write_future is not None:
+                    pending_write_future.result()
+                pending_write_future = write_executor.submit(
+                    _write_chunk_behind,
+                    quantized, chunk_path, prev_tail_latents_cpu,
+                    output_start, list(chunk_files), list(chunk_meta), global_min, global_max,
+                )
+
                 del frames, result, tensor_res
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                output_start += chunk_size
-                save_checkpoint()
+            if pending_write_future is not None:
+                pending_write_future.result()
 
             print("\n==> Depth pass complete.")
             print(f"==> GLOBAL depth range: {global_min:.6f} .. {global_max:.6f}")
@@ -703,11 +769,19 @@ class DepthCrafterDemo:
             )
 
         except Exception:
+            if pending_write_future is not None:
+                try:
+                    pending_write_future.result()
+                except Exception:
+                    pass  # don't mask the original exception below with a secondary one
             print(
                 f"==> Depth pass failed - checkpoint kept at {checkpoint_dir} "
                 f"({len(chunk_files)} chunk(s) done). Rerun the same command to resume."
             )
             raise
+        finally:
+            read_executor.shutdown(wait=False)
+            write_executor.shutdown(wait=False)
 
 
 class ForwardWarpStereo(nn.Module):
