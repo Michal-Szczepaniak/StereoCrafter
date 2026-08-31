@@ -5,9 +5,16 @@ import shutil
 import subprocess
 import sys
 import time
+import concurrent.futures
 import cv2
 import numpy as np
 from fire import Fire
+
+# cv2's own internal (OpenCV-thread-pool) parallelism is disabled in favor of
+# our own per-frame ThreadPoolExecutor below (see _prefill_occlusion) - letting
+# both run at once oversubscribes the CPU with nested thread pools.
+cv2.setNumThreads(1)
+_INPAINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
 
 import torch
 import torch.nn.functional as F
@@ -162,10 +169,16 @@ def _prefill_occlusion(warp_np: np.ndarray, mask_np: np.ndarray, radius: int = 5
     with more steps/guidance - a plausible classical starting point gives it
     something to refine instead of invent from nothing."""
     out = warp_np.copy()
-    for t in range(warp_np.shape[0]):
+
+    def _inpaint_frame(t):
         hole = (mask_np[t] > 127).astype(np.uint8) * 255
         if hole.any():
-            out[t] = cv2.inpaint(warp_np[t], hole, radius, cv2.INPAINT_TELEA)
+            return t, cv2.inpaint(warp_np[t], hole, radius, cv2.INPAINT_TELEA)
+        return t, None
+
+    for t, result in _INPAINT_EXECUTOR.map(_inpaint_frame, range(warp_np.shape[0])):
+        if result is not None:
+            out[t] = result
     return out
 
 
