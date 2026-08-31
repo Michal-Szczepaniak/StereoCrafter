@@ -108,7 +108,14 @@ def ffv1_encode(frames, out_path, pix_fmt, width, height):
             "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-s", f"{width}x{height}", "-r", "24",
             "-i", "-",
-            "-c:v", "ffv1", "-level", "3",
+            # slices/threads: FFV1's own multithreading is slice-based -
+            # without both set explicitly it encodes single-threaded
+            # regardless of core count. 16 is a standard FFV1 slice count
+            # (divides cleanly, decodes fine in any FFV1-capable player);
+            # threads 0 = auto-detect available cores. Purely an internal
+            # encoding-structure detail - doesn't change the decoded pixel
+            # data at all, still bit-exact lossless.
+            "-c:v", "ffv1", "-level", "3", "-slices", "16", "-threads", "0",
             out_path,
         ],
         stdin=subprocess.PIPE,
@@ -133,6 +140,7 @@ def ffv1_decode(path, pix_fmt, width, height, channels, dtype=np.uint8):
     proc = subprocess.run(
         [
             "ffmpeg", "-loglevel", "error",
+            "-threads", "0",  # decode is also slice-parallel for FFV1 - same reasoning as ffv1_encode's flags
             "-i", path,
             "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-",
