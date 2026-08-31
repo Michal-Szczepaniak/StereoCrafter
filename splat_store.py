@@ -72,6 +72,7 @@ since inpainting's sliding window with overlap re-reads nearby frames
 across consecutive calls.
 """
 
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -112,7 +113,16 @@ def ffv1_encode(frames, out_path, pix_fmt, width, height):
         ],
         stdin=subprocess.PIPE,
     )
-    proc.stdin.write(frames.tobytes())
+    # 8th instance of the same OOM bug class found this session (proactive
+    # audit, not a crash yet): frames.tobytes() in one call materializes a
+    # SECOND full-size copy of the whole array (the bytes buffer, alongside
+    # the numpy array itself) before ffmpeg ever sees a byte of it - doubles
+    # peak RAM for whatever's being checkpointed (e.g. the quantized depth
+    # array at a large CHUNK_SIZE). Write in small batches instead - each
+    # slice's .tobytes() only copies that slice, not the whole array.
+    write_batch = 8
+    for i in range(0, frames.shape[0], write_batch):
+        proc.stdin.write(frames[i : i + write_batch].tobytes())
     proc.stdin.close()
     ret = proc.wait()
     if ret != 0:
@@ -138,7 +148,16 @@ def ffv1_decode(path, pix_fmt, width, height, channels, dtype=np.uint8):
 class _CompressedWriter:
     """Buffers contiguous frame writes in RAM, FFV1-encodes to a new group
     file on each .flush() call. See module docstring for why group
-    boundaries just follow the caller's own flush cadence."""
+    boundaries just follow the caller's own flush cadence.
+
+    The actual encode runs on a background thread (write-behind, same
+    pattern already used for the depth checkpoint itself in
+    depth_splatting_inference.py) so the caller can flush often - bounding
+    how much sits in self._buffer at once, found to matter at a large
+    outer CHUNK_SIZE (a whole chunk's worth of frames buffered until one
+    flush() at chunk end scales the concatenate + encode with CHUNK_SIZE,
+    same OOM shape as everything else fixed this session) - without
+    stalling the caller on each ffmpeg subprocess launch."""
 
     def __init__(self, store_dir, prefix, height, width, channels):
         self._store_dir = store_dir
@@ -151,6 +170,10 @@ class _CompressedWriter:
         self._next_frame = 0
         self._group_index = 0
         self._groups = []  # [{"start", "count", "file"}, ...]
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"ffv1-write-{prefix}"
+        )
+        self._pending = []  # in-flight encode futures - waited on in close()
 
     def __setitem__(self, key, value):
         assert isinstance(key, slice) and key.step in (None, 1), \
@@ -165,6 +188,14 @@ class _CompressedWriter:
         self._next_frame = stop
 
     def flush(self):
+        """Snapshots + resets the buffer synchronously (cheap - only
+        whatever's accumulated since the last flush, not the whole chunk),
+        then hands the actual concatenate + FFV1 encode off to a background
+        thread. Group metadata is recorded immediately since it's known
+        upfront (start/count/filename don't depend on the encode having
+        actually run yet) - close() waits for every outstanding encode
+        before returning, so every file the index references really exists
+        on disk by then."""
         if not self._buffer:
             return
         data = self._buffer[0] if len(self._buffer) == 1 else np.concatenate(self._buffer, axis=0)
@@ -172,16 +203,23 @@ class _CompressedWriter:
         group_start = self._next_frame - n
         filename = f"{self._prefix}_{self._group_index:06d}.mkv"
         out_path = os.path.join(self._store_dir, filename)
-        ffv1_encode(data, out_path, self._pix_fmt, self._width, self._height)
         self._groups.append({"start": group_start, "count": n, "file": filename})
         self._group_index += 1
         self._buffer = []
+        self._pending.append(
+            self._executor.submit(ffv1_encode, data, out_path, self._pix_fmt, self._width, self._height)
+        )
 
     def close(self):
-        """Final flush + write the group index. Must be called once after
-        all writes are done (DepthSplatting's own trailing .flush() calls
-        do NOT write the index - call this explicitly, see create_store)."""
+        """Final flush + wait for every outstanding background encode +
+        write the group index. Must be called once after all writes are
+        done (DepthSplatting's own trailing .flush() calls do NOT write the
+        index - call this explicitly, see create_store)."""
         self.flush()
+        for future in self._pending:
+            future.result()  # re-raises here if a background encode failed
+        self._pending = []
+        self._executor.shutdown(wait=True)
         index_path = os.path.join(self._store_dir, f"{self._prefix}_index.json")
         with open(index_path, "w") as f:
             json.dump(self._groups, f, indent=2)

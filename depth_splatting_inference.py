@@ -708,8 +708,15 @@ class DepthCrafterDemo:
                 # source, on the raw low-res chunk, before any upsampling -
                 # validated end-to-end (real splat + real stage-2
                 # inpainting) on real footage, not just visual inspection.
-                tensor_res = torch.from_numpy(result).unsqueeze(1).float().cuda()
-                edge_threshold = tensor_res.min() + edge_threshold_frac * (tensor_res.max() - tensor_res.min())
+                # edge_threshold only needs a global min/max, computed
+                # straight from the numpy array - no need to hold the whole
+                # chunk on GPU just for a scalar reduction (this itself was
+                # an unbatched full-chunk GPU allocation, found via the same
+                # audit that found the depth-quantization/splatting-pass
+                # instances below).
+                edge_threshold = float(result.min()) + edge_threshold_frac * (
+                    float(result.max()) - float(result.min())
+                )
                 # Same OOM bug class found (and fixed) 3x already this
                 # session in the DepthCrafter submodule, this time in our
                 # own code: _edge_threshold_fill is a pure per-frame spatial
@@ -718,13 +725,14 @@ class DepthCrafterDemo:
                 # WHOLE chunk's tensor_res at once - fine at the old small
                 # CHUNK_SIZE, OOMs at a large one. Batch it by
                 # decode_chunk_size like everything else, bit-identical
-                # result since each frame is independent.
+                # result since each frame is independent - and move each
+                # batch to GPU just-in-time here too, instead of the whole
+                # chunk upfront.
                 edge_filled_batches = []
-                for i in range(0, tensor_res.shape[0], decode_chunk_size):
+                for i in range(0, result.shape[0], decode_chunk_size):
+                    batch_gpu = torch.from_numpy(result[i : i + decode_chunk_size]).unsqueeze(1).float().cuda()
                     edge_filled_batches.append(
-                        _edge_threshold_fill(
-                            tensor_res[i : i + decode_chunk_size], edge_threshold, edge_fill_iters
-                        )
+                        _edge_threshold_fill(batch_gpu, edge_threshold, edge_fill_iters)
                     )
                 tensor_res = torch.cat(edge_filled_batches, dim=0)
                 # 5th instance of the same OOM bug class this session:
@@ -745,12 +753,16 @@ class DepthCrafterDemo:
                         size=(original_height, original_width),
                         mode="nearest",
                     )
-                    result_batches.append(batch_upsampled[:, 0].cpu().numpy())
+                    batch_np = batch_upsampled[:, 0].cpu().numpy()
+                    # Checked per-batch (a smaller-magnitude instance of the
+                    # same audit - a full-chunk np.isfinite(result) boolean
+                    # array is "only" ~3GiB at this CHUNK_SIZE, versus the
+                    # ~12GiB float32 ones above, but still real) rather than
+                    # once on the whole concatenated result.
+                    if not np.isfinite(batch_np).all():
+                        raise RuntimeError("DepthCrafter produced NaN/Inf depth in a streaming chunk.")
+                    result_batches.append(batch_np)
                 result = np.concatenate(result_batches, axis=0)
-
-                finite = np.isfinite(result)
-                if not finite.all():
-                    raise RuntimeError("DepthCrafter produced NaN/Inf depth in a streaming chunk.")
 
                 # discard = how many frames at the start of this chunk's output
                 # duplicate the tail already emitted by the previous chunk (now
@@ -1195,12 +1207,18 @@ def DepthSplatting(
 
     for chunk_index, chunk_path in enumerate(chunk_files):
         meta_c = chunk_meta[chunk_index]
+        # 7th instance of the same OOM bug class this session (found via a
+        # proactive audit, not a crash): dequantizing the WHOLE chunk in one
+        # unbatched numpy expression, at full original resolution this time
+        # (not the low-res depth-inference-pass resolution) - at
+        # CHUNK_SIZE=1440/1080x1920 the .astype(np.float32) alone is
+        # ~11.9GiB, same order of magnitude as the depth-quantization bug
+        # already fixed. Keep `quantized` as the cheap uint16 array and only
+        # dequantize batch_size-sized slices, inside the loop below (which
+        # already batches everything else in this pass) - see
+        # batch_depth's own computation further down.
         quantized = ffv1_decode(chunk_path, "gray16le", width, height, channels=None, dtype=np.uint16)
-        depth_chunk = (
-            meta_c["min"]
-            + quantized.astype(np.float32) / DEPTH_QUANT_LEVELS * (meta_c["max"] - meta_c["min"])
-        )
-        chunk_frames = min(depth_chunk.shape[0], num_frames - frame_offset)
+        chunk_frames = min(quantized.shape[0], num_frames - frame_offset)
         if chunk_frames <= 0:
             break
 
@@ -1221,8 +1239,19 @@ def DepthSplatting(
             timing_str = ""
         progress.set_header(frame_offset, chunk_index + 1, chunk_frames, timing_str)
 
+        # 9th instance of the same OOM bug class this session (proactive
+        # audit): flush() used to only get called once per outer chunk
+        # (below, after this loop) - fine at the old small CHUNK_SIZE, but
+        # at a large one it means ALL of this chunk's batches sit buffered
+        # in RAM until then, and flush()'s own concatenate scales with
+        # however much accumulated. Flushing every FLUSH_EVERY_N_BATCHES
+        # batches instead bounds the buffer regardless of CHUNK_SIZE - safe
+        # to do often now that flush() hands the actual encode off to a
+        # background thread (see _CompressedWriter in splat_store.py) and
+        # so no longer blocks this loop on an ffmpeg subprocess launch.
+        FLUSH_EVERY_N_BATCHES = 8
         total_batches = (chunk_frames + batch_size - 1) // batch_size
-        for i in range(0, chunk_frames, batch_size):
+        for batch_num, i in enumerate(range(0, chunk_frames, batch_size), start=1):
             progress.set_batch(i // batch_size + 1, total_batches)
             end = min(i + batch_size, chunk_frames)
 
@@ -1244,7 +1273,13 @@ def DepthSplatting(
                 vid_reader.get_batch(native_indices).asnumpy().astype(np.float32) / 255.0
             )
             n = len(native_indices)  # keep depth aligned if clipped near EOF
-            batch_depth = np.asarray(depth_chunk[i : i + n], dtype=np.float32)
+            # Dequantize only this batch (see the comment above the
+            # `quantized = ffv1_decode(...)` line for why the whole chunk
+            # isn't dequantized upfront anymore).
+            batch_depth = (
+                meta_c["min"]
+                + quantized[i : i + n].astype(np.float32) / DEPTH_QUANT_LEVELS * (meta_c["max"] - meta_c["min"])
+            )
 
             batch_depth = (batch_depth - global_min) / (global_max - global_min)
             batch_depth = np.clip(batch_depth, 0.0, 1.0)
@@ -1277,9 +1312,13 @@ def DepthSplatting(
                 right_video, occlusion_mask, right_u8, mask_u8,
             )
 
-        # Flush this chunk's writes to disk and release GPU memory before
-        # starting the next depth chunk - same cadence as before, just no
-        # video writer to release.
+            if batch_num % FLUSH_EVERY_N_BATCHES == 0:
+                warp_store.flush()
+                mask_store.flush()
+
+        # Final flush for whatever's left over (chunk_frames isn't
+        # necessarily a multiple of batch_size*FLUSH_EVERY_N_BATCHES), and
+        # release GPU memory before starting the next depth chunk.
         warp_store.flush()
         mask_store.flush()
         gc.collect()
