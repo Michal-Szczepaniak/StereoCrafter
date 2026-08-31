@@ -710,7 +710,23 @@ class DepthCrafterDemo:
                 # inpainting) on real footage, not just visual inspection.
                 tensor_res = torch.from_numpy(result).unsqueeze(1).float().cuda()
                 edge_threshold = tensor_res.min() + edge_threshold_frac * (tensor_res.max() - tensor_res.min())
-                tensor_res = _edge_threshold_fill(tensor_res, edge_threshold, edge_fill_iters)
+                # Same OOM bug class found (and fixed) 3x already this
+                # session in the DepthCrafter submodule, this time in our
+                # own code: _edge_threshold_fill is a pure per-frame spatial
+                # op (up/down/left/right neighbor shifts within each frame,
+                # no cross-frame dependency at all) but was being run on the
+                # WHOLE chunk's tensor_res at once - fine at the old small
+                # CHUNK_SIZE, OOMs at a large one. Batch it by
+                # decode_chunk_size like everything else, bit-identical
+                # result since each frame is independent.
+                edge_filled_batches = []
+                for i in range(0, tensor_res.shape[0], decode_chunk_size):
+                    edge_filled_batches.append(
+                        _edge_threshold_fill(
+                            tensor_res[i : i + decode_chunk_size], edge_threshold, edge_fill_iters
+                        )
+                    )
+                tensor_res = torch.cat(edge_filled_batches, dim=0)
                 result = F.interpolate(
                     tensor_res,
                     size=(original_height, original_width),
