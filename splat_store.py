@@ -170,8 +170,15 @@ class _CompressedWriter:
         self._next_frame = 0
         self._group_index = 0
         self._groups = []  # [{"start", "count", "file"}, ...]
+        # max_workers>1 lets multiple flush groups encode concurrently
+        # (each is a fully independent job - its own captured `data` array,
+        # its own uniquely-named output file - so nothing shared to worry
+        # about between workers). Bounded rather than unlimited so this
+        # doesn't spawn an unbounded pile of simultaneous ffmpeg
+        # subprocesses if the main GPU loop ever produces flush-worthy
+        # batches faster than they can be encoded.
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"ffv1-write-{prefix}"
+            max_workers=4, thread_name_prefix=f"ffv1-write-{prefix}"
         )
         self._pending = []  # in-flight encode futures - waited on in close()
 
