@@ -727,12 +727,26 @@ class DepthCrafterDemo:
                         )
                     )
                 tensor_res = torch.cat(edge_filled_batches, dim=0)
-                result = F.interpolate(
-                    tensor_res,
-                    size=(original_height, original_width),
-                    mode="nearest",
-                )
-                result = result[:, 0].cpu().numpy()
+                # 5th instance of the same OOM bug class this session:
+                # F.interpolate is a pure per-frame spatial resize (nearest
+                # neighbor, no cross-frame dependency) but was upsampling
+                # the WHOLE chunk to full original resolution in one shot -
+                # at CHUNK_SIZE=1440 and 1080x1920 that's an ~11.1GiB tensor
+                # on its own, both on GPU (the interpolate call itself) and
+                # then again in system RAM (the .cpu().numpy() copy right
+                # after). Batch it, converting each batch to numpy
+                # immediately so the GPU-side tensor for that batch is
+                # freed before the next one starts, bounding both VRAM and
+                # system RAM by decode_chunk_size instead of CHUNK_SIZE.
+                result_batches = []
+                for i in range(0, tensor_res.shape[0], decode_chunk_size):
+                    batch_upsampled = F.interpolate(
+                        tensor_res[i : i + decode_chunk_size],
+                        size=(original_height, original_width),
+                        mode="nearest",
+                    )
+                    result_batches.append(batch_upsampled[:, 0].cpu().numpy())
+                result = np.concatenate(result_batches, axis=0)
 
                 finite = np.isfinite(result)
                 if not finite.all():
