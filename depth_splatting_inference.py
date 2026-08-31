@@ -145,6 +145,8 @@ class LiveProgress:
         self._batch_total = 0
         self._step = 0
         self._num_steps = 0
+        self._window_idx = 0
+        self._window_total = 0
         self._last_len = 0
 
     def set_header(self, frame_offset, chunk_index, chunk_frames, timing_str):
@@ -153,23 +155,32 @@ class LiveProgress:
             f"(chunk {chunk_index}/{self.total_chunks}, {chunk_frames} frames){timing_str}"
         )
         self._batch_idx = self._batch_total = self._step = self._num_steps = 0
+        self._window_idx = self._window_total = 0
         self._render()
 
     def set_batch(self, batch_idx: int, batch_total: int):
         self._batch_idx, self._batch_total = batch_idx, batch_total
         self._render()
 
-    def set_step(self, step: int, num_steps: int):
+    def set_step(self, step: int, num_steps: int, window_idx: int = 0, window_total: int = 0):
         """Sub-level used by DepthCrafterDemo.infer()'s self.pipe() call, fed
         via callback_on_step_end - the denoising-step analogue of set_batch
-        (splatting's per-batch warp call has no denoising steps of its own)."""
+        (splatting's per-batch warp call has no denoising steps of its own).
+        window_idx/window_total (optional) surface WHICH of the chunk's own
+        internal DepthCrafter windows this step belongs to - a big
+        CHUNK_SIZE chains many of these per chunk, and without this the
+        step counter alone looks like it's "resetting" for no visible
+        reason every time a new window starts."""
         self._step, self._num_steps = step, num_steps
+        self._window_idx, self._window_total = window_idx, window_total
         self._render()
 
     def _render(self):
         line = self._header
         if self._batch_total:
             line += f" | batch {self._batch_idx}/{self._batch_total}"
+        if self._window_total:
+            line += f" | window {self._window_idx}/{self._window_total}"
         if self._num_steps:
             line += f" | step {self._step}/{self._num_steps}"
         pad = max(self._last_len - len(line), 0)
@@ -180,6 +191,25 @@ class LiveProgress:
     def finish_chunk(self):
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+
+def _count_internal_windows(num_frames: int, window_size: int, overlap: int) -> int:
+    """How many internal sliding windows DepthCrafterPipeline.__call__ will
+    run for a self.pipe() call over `num_frames` raw input frames - mirrors
+    that method's own `while idx_start < num_frames - overlap: ...
+    idx_start += stride` loop exactly (depth_crafter_ppl.py), so the count
+    shown in the progress line always matches reality regardless of
+    CHUNK_SIZE/WINDOW_SIZE/WINDOW_OVERLAP. Only used for the live progress
+    display - not fed back into the pipeline call itself."""
+    if num_frames <= window_size:
+        return 1  # degenerate single-window case, same condition the pipeline itself checks
+    stride = window_size - overlap
+    idx_start = 0
+    count = 0
+    while idx_start < num_frames - overlap:
+        count += 1
+        idx_start += stride
+    return count
 
 
 def _store_is_complete(store_dir, expected_params):
@@ -614,8 +644,18 @@ class DepthCrafterDemo:
                     timing_str = ""
                 progress.set_header(output_start, chunk_num + 1, input_end - input_start, timing_str)
 
+                total_windows_this_chunk = _count_internal_windows(
+                    frames.shape[0], window_size, window_overlap
+                )
+                window_counter = {"idx": 0}
+
                 def _progress_step_callback(pipe, step, timestep, callback_kwargs):
-                    progress.set_step(step + 1, num_denoising_steps)
+                    if step == 0:
+                        window_counter["idx"] += 1
+                    progress.set_step(
+                        step + 1, num_denoising_steps,
+                        window_counter["idx"], total_windows_this_chunk,
+                    )
                     return callback_kwargs
 
                 with torch.inference_mode():
