@@ -782,7 +782,25 @@ class DepthCrafterDemo:
                 # for) is quantized to whole/half pixels anyway.
                 chunk_path = os.path.join(checkpoint_dir, f"depth_{len(chunk_files):06d}.mkv")
                 chunk_range = max(float(chunk_max) - float(chunk_min), 1e-12)
-                quantized = np.round((result - chunk_min) / chunk_range * DEPTH_QUANT_LEVELS).astype(np.uint16)
+                # 6th instance of the same OOM bug class this session - this
+                # time in system RAM, not VRAM. chunk_min/chunk_max genuinely
+                # need the WHOLE chunk's result first (a real global
+                # reduction, can't batch that part), but the quantization
+                # itself only needs those two now-known scalars plus each
+                # frame's own values - no cross-frame dependency. The
+                # original one-liner created several full-chunk-sized float
+                # temporaries at once (subtract, divide, multiply, round,
+                # cast all allocate fresh arrays in numpy) - at
+                # CHUNK_SIZE=1440/1080x1920 each one alone is ~11.9GiB.
+                # Preallocating the final (smaller, uint16) array and
+                # filling it batch-by-batch bounds the temporaries to
+                # decode_chunk_size instead of the whole chunk.
+                quantized = np.empty(result.shape, dtype=np.uint16)
+                for i in range(0, result.shape[0], decode_chunk_size):
+                    batch = result[i : i + decode_chunk_size]
+                    quantized[i : i + decode_chunk_size] = np.round(
+                        (batch - chunk_min) / chunk_range * DEPTH_QUANT_LEVELS
+                    ).astype(np.uint16)
                 chunk_files.append(chunk_path)
                 chunk_meta.append({
                     "min": float(chunk_min), "max": float(chunk_max), "frames": int(result.shape[0]),
