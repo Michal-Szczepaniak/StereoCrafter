@@ -160,10 +160,15 @@ save_elapsed() {
     echo "$total" > "$TIME_FILE"
     echo
     echo "==> This session: $(format_duration "$this_run") | Total season time so far: $(format_duration "$total")"
+    notify_telegram "Season script stopped.
+This session: $(format_duration "$this_run")
+Total season time so far: $(format_duration "$total")"
 }
 trap save_elapsed EXIT
 
 echo "==> Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED")"
+notify_telegram "Season script started.
+Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED")"
 
 mapfile -t EPISODES < <(find "$EPISODES_DIR" -type f \
     \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.webm' \) \
