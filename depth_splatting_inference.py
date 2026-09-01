@@ -473,12 +473,24 @@ class DepthCrafterDemo:
                 f"internal window and can't hand off a latent tail to the next chunk."
             )
 
-        vid = VideoReader(
-            input_video_path,
-            ctx=cpu(0),
-            width=processing_width,
-            height=processing_height,
-        )
+        def _make_video_reader():
+            """A fresh VideoReader per chunk read, not one reused for the
+            whole episode - decord has a well-documented memory-growth bug
+            (dmlc/decord issues #197, #279, #323, #218) where repeated
+            get_batch() calls on the SAME instance leak RAM on Linux,
+            confirmed this session via a real local repro: RSS after each
+            chunk's checkpoint save climbed 5.6GiB -> 11.1GiB -> 12.8GiB
+            across just 3 small (CHUNK_SIZE=110) chunks with one shared
+            VideoReader, at a video/resolution scale far too small to
+            explain that growth as legitimate per-chunk work. A fresh
+            instance per read avoids decord's internal state ever
+            accumulating past one chunk's worth."""
+            return VideoReader(
+                input_video_path,
+                ctx=cpu(0),
+                width=processing_width,
+                height=processing_height,
+            )
 
         # ------------------------------------------------------------------
         # PASS 1: run DepthCrafter chunk-by-chunk, save depth chunks to disk.
@@ -608,7 +620,7 @@ class DepthCrafterDemo:
         pending_write_future = None
 
         in_start, in_end = _next_chunk_range(output_start)
-        pending_read_future = read_executor.submit(read_video_chunk_streaming, vid, in_start, in_end, stride)
+        pending_read_future = read_executor.submit(read_video_chunk_streaming, _make_video_reader(), in_start, in_end, stride)
 
         try:
             while output_start < total_frames:
@@ -633,7 +645,7 @@ class DepthCrafterDemo:
                 if next_output_start < total_frames:
                     in_start, in_end = _next_chunk_range(next_output_start)
                     pending_read_future = read_executor.submit(
-                        read_video_chunk_streaming, vid, in_start, in_end, stride
+                        read_video_chunk_streaming, _make_video_reader(), in_start, in_end, stride
                     )
                 else:
                     pending_read_future = None
@@ -1337,7 +1349,7 @@ def DepthSplatting(
         torch.cuda.empty_cache()
 
         frame_offset += chunk_frames
-        del depth_chunk
+        del quantized
 
         # Free this chunk's depth file now that it's safely flushed into
         # warp_store/mask_store - depth (float32, 1ch) and warp+mask
