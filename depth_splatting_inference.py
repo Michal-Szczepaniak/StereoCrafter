@@ -321,6 +321,18 @@ class DepthCrafterDemo:
             unet=unet,
             torch_dtype=torch.float16,
             variant="fp16",
+            # Matches the UNet load above - was asymmetrically missing here.
+            # Loading (VAE/image-encoder/scheduler components) without this
+            # stages full-precision weights through regular CPU memory
+            # before casting/moving to GPU, instead of the meta-device/
+            # streamed load this flag enables. A real, verified ~10GB+ RAM
+            # gap vs an equivalent CUDA setup was measured this session at
+            # CHUNK_SIZE=210 (well away from any of the chunk-size-driven
+            # issues also found tonight) - this is the leading, previously
+            # unapplied candidate for narrowing that gap. Purely a loading-
+            # time memory optimization, bit-identical resulting weights/
+            # outputs either way.
+            low_cpu_mem_usage=True,
         )
 
         if cpu_offload is not None:
