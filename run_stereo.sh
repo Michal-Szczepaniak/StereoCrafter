@@ -198,6 +198,8 @@ run_with_retries() {
     done
 }
 
+STAGE1_LOG="$OUTPUT_DIR/stage1.log"
+
 stage1_run() {
     python depth_splatting_inference.py \
         --input_video_path "$INPUT_VIDEO" \
@@ -218,7 +220,8 @@ stage1_run() {
         --disp_tolerance="$DISP_TOLERANCE" \
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
-        --edge_fill_iters="$EDGE_FILL_ITERS"
+        --edge_fill_iters="$EDGE_FILL_ITERS" \
+        2>&1 | tee "$STAGE1_LOG"
 }
 
 echo "==================================================================="
