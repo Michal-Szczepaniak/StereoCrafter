@@ -1143,6 +1143,8 @@ def DepthSplatting(
     store_params=None,
     compress_store=True,
     disp_tolerance=1.0,
+    device="cuda",
+    keep_depth_chunks=False,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -1165,6 +1167,23 @@ def DepthSplatting(
     format if you ever need to debug/compare against it directly. (This
     only affects warp/mask - the depth checkpoint read below is always
     quantized+compressed, independent of this flag.)
+
+    device: "cuda" (default, matches every existing caller - main() always
+    ran this straight after a GPU depth pass) or "cpu" for running this
+    stage standalone from a fetched checkpoint on a machine with no GPU -
+    see splat_from_checkpoint.py. ForwardWarpStereo's own splat math already
+    reads its device off the input tensors (see _zbuffer_splat), so this
+    only needs to thread through the handful of places that used to
+    hardcode .cuda().
+
+    keep_depth_chunks: False (default) matches the original behavior - each
+    chunk's depth file is deleted right after it's flushed into warp/mask
+    (see the os.remove call below) so a single combined depth+splat run on
+    a full episode never needs 2x disk. Set True when the checkpoint is a
+    fetched artifact you want to reuse across multiple splatting attempts
+    (e.g. re-running with different max_disp/disp_tolerance) - see
+    splat_from_checkpoint.py, which defaults to True for exactly that
+    reason.
 
     FIX (carried over): depth chunk index i was computed from source video
     frame i*stride (DepthCrafter runs on a temporally-subsampled clip
@@ -1218,7 +1237,7 @@ def DepthSplatting(
     # at their defaults rather than removed from the signature.
     stereo_projector = ForwardWarpStereo(
         occlu_map=True, crack_radius=2, disp_tolerance=disp_tolerance, use_zbuffer_splat=False
-    ).cuda()
+    ).to(device)
 
     frame_offset = 0
 
@@ -1308,8 +1327,8 @@ def DepthSplatting(
             batch_depth = (batch_depth - global_min) / (global_max - global_min)
             batch_depth = np.clip(batch_depth, 0.0, 1.0)
 
-            left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
-            disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
+            left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().to(device)
+            disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().to(device)
             disp_map = disp_map * 2.0 - 1.0
             disp_map = disp_map * max_disp
 
@@ -1346,7 +1365,8 @@ def DepthSplatting(
         warp_store.flush()
         mask_store.flush()
         gc.collect()
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         frame_offset += chunk_frames
         del quantized
@@ -1362,7 +1382,8 @@ def DepthSplatting(
         # point can no longer redo splatting from chunk 0 (this chunk's
         # depth file is gone) - accepted since the alternative (no delete)
         # fails every time anyway.
-        os.remove(chunk_path)
+        if not keep_depth_chunks:
+            os.remove(chunk_path)
         progress.finish_chunk()
 
     warp_store.flush()
@@ -1403,6 +1424,7 @@ def main(
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 3,
+    depth_only: bool = False,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -1436,6 +1458,14 @@ def main(
     immediately without loading the model or touching the GPU at all -
     infer()'s own checkpoint can't cover this case since it's deleted the
     moment stage 1 finishes (see _store_is_complete's docstring).
+
+    depth_only: run the depth pass and stop - skip DepthSplatting and skip
+    deleting the checkpoint. For splitting depth (GPU-bound) and splatting
+    (comparatively cheap - can run on a smaller/no GPU, see splat_store's
+    device arg) across two machines: run this with depth_only=True on the
+    GPU box, fetch {output_dir}/.depth_checkpoint/ (manifest.json + the
+    quantized depth chunk files) plus the source video elsewhere, then feed
+    that checkpoint dir to splat_from_checkpoint.py's --checkpoint_dir.
     """
     store_params = {
         "input_video_path": os.path.abspath(input_video_path),
@@ -1491,6 +1521,10 @@ def main(
         edge_threshold_frac=edge_threshold_frac,
         edge_fill_iters=edge_fill_iters,
     )
+
+    if depth_only:
+        print(f"==> depth_only=True - stopping after the depth pass. Checkpoint kept at {checkpoint_dir}")
+        return
 
     try:
         DepthSplatting(
