@@ -114,6 +114,15 @@ format_duration() {
     printf '%dh %dm %ds' $((total / 3600)) $(((total % 3600) / 60)) $((total % 60))
 }
 
+# For funzies - a rough electricity-cost estimate, not a real accounting
+# figure: COST_PER_HOUR_PLN (default 0.75 zł/h) is a flat guess, not a
+# measured draw for this specific card/PSU.
+COST_PER_HOUR_PLN="${COST_PER_HOUR_PLN:-0.75}"
+format_cost() {
+    local total=$1
+    awk -v s="$total" -v rate="$COST_PER_HOUR_PLN" 'BEGIN{printf "%.2f zł", s/3600*rate}'
+}
+
 # ---- optional Telegram notifications - completely silent no-op unless
 # telegram.env exists (gitignored, never committed - see
 # telegram.env.example for the format). Never blocks/fails the actual
@@ -159,16 +168,16 @@ save_elapsed() {
     total=$((PRIOR_ELAPSED + this_run))
     echo "$total" > "$TIME_FILE"
     echo
-    echo "==> This session: $(format_duration "$this_run") | Total season time so far: $(format_duration "$total")"
+    echo "==> This session: $(format_duration "$this_run") (~$(format_cost "$this_run")) | Total season time so far: $(format_duration "$total") (~$(format_cost "$total"))"
     notify_telegram "Season script stopped.
-This session: $(format_duration "$this_run")
-Total season time so far: $(format_duration "$total")"
+This session: $(format_duration "$this_run") (~$(format_cost "$this_run"))
+Total season time so far: $(format_duration "$total") (~$(format_cost "$total"))"
 }
 trap save_elapsed EXIT
 
-echo "==> Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED")"
+echo "==> Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED") (~$(format_cost "$PRIOR_ELAPSED"))"
 notify_telegram "Season script started.
-Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED")"
+Total time already spent on this season: $(format_duration "$PRIOR_ELAPSED") (~$(format_cost "$PRIOR_ELAPSED"))"
 
 mapfile -t EPISODES < <(find "$EPISODES_DIR" -type f \
     \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.webm' \) \
@@ -205,9 +214,9 @@ for EP in "${EPISODES[@]}"; do
     EP_ELAPSED=$(($(date +%s) - EP_START))
 
     touch "$DONE_MARKER"
-    echo "==> [$EP_NAME] stage 1+2 complete in $(format_duration "$EP_ELAPSED") - removing splat store to free disk"
+    echo "==> [$EP_NAME] stage 1+2 complete in $(format_duration "$EP_ELAPSED") (~$(format_cost "$EP_ELAPSED")) - removing splat store to free disk"
     notify_telegram "Episode done: $EP_NAME
-Took $(format_duration "$EP_ELAPSED")."
+Took $(format_duration "$EP_ELAPSED") (~$(format_cost "$EP_ELAPSED"))."
     rm -rf "$EP_OUTPUT_DIR/splat"
     DONE_COUNT=$((DONE_COUNT + 1))
 done
