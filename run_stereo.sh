@@ -201,7 +201,7 @@ run_with_retries() {
 STAGE1_LOG="$OUTPUT_DIR/stage1.log"
 
 stage1_run() {
-    python depth_splatting_inference.py \
+    python -u depth_splatting_inference.py \
         --input_video_path "$INPUT_VIDEO" \
         --output_dir "$SPLAT_DIR" \
         --unet_path "$DEPTHCRAFTER_UNET" \
@@ -244,7 +244,7 @@ stage2_run() {
     if [[ -n "$MASK_SKIP_THRESHOLD" ]]; then
         MASK_SKIP_ARG=(--mask_skip_threshold "$MASK_SKIP_THRESHOLD")
     fi
-    python inpainting_inference.py \
+    python -u inpainting_inference.py \
         --pre_trained_path "$SVD_WEIGHTS" \
         --unet_path "$STEREOCRAFTER_UNET" \
         --splat_store_dir "$SPLAT_DIR" \
