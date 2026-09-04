@@ -19,7 +19,7 @@ Usage:
         --checkpoint_dir /path/to/fetched/.depth_checkpoint \\
         --input_video_path /path/to/same/source.mp4 \\
         --store_dir ./outputs/experiment/splat \\
-        --max_disp 20.0 --disp_tolerance 1.0
+        --max_disp 20.0 --disp_tolerance 1.0 --minutes 5
 """
 
 import json
@@ -41,6 +41,7 @@ def main(
     device: str = "cpu",
     dataset: str = "open",
     keep_depth_chunks: bool = True,
+    minutes: float = None,
 ):
     """device: "cpu" by default (the point of this script) - pass "cuda" to
     run it on a GPU machine too, e.g. to A/B splatting params quickly
@@ -50,6 +51,12 @@ def main(
     default) - a fetched checkpoint is meant to be reused across multiple
     splatting attempts, not consumed by the first one. Pass False if this
     checkpoint is disposable and you want it cleaned up as it's consumed.
+
+    minutes: None (default) splats the whole checkpoint. Set to stop after
+    this many minutes of output instead - e.g. --minutes 5 for a quick test
+    without waiting on (or consuming) the rest of the episode. Converted to
+    a frame count using target_fps once it's known (see get_video_info call
+    below), then passed through as DepthSplatting's max_frames.
     """
     manifest_path = os.path.join(checkpoint_dir, "manifest.json")
     with open(manifest_path) as f:
@@ -73,6 +80,8 @@ def main(
         _total_frames,
     ) = get_video_info(input_video_path, params["max_res"], params["target_fps"], dataset)
 
+    max_frames = round(minutes * 60 * target_fps) if minutes else None
+
     DepthSplatting(
         input_video_path,
         store_dir,
@@ -91,6 +100,7 @@ def main(
         disp_tolerance=disp_tolerance,
         device=device,
         keep_depth_chunks=keep_depth_chunks,
+        max_frames=max_frames,
     )
 
 

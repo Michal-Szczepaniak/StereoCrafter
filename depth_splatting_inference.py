@@ -1145,6 +1145,7 @@ def DepthSplatting(
     disp_tolerance=1.0,
     device="cuda",
     keep_depth_chunks=False,
+    max_frames=None,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -1185,6 +1186,13 @@ def DepthSplatting(
     splat_from_checkpoint.py, which defaults to True for exactly that
     reason.
 
+    max_frames: None (default) processes the whole episode. Set to stop
+    early after this many output frames instead - e.g. for a quick "5
+    minutes of output" test run without splatting the whole thing. Combine
+    with keep_depth_chunks=True so the untouched later chunks are left
+    exactly as they were (the per-chunk loop below simply breaks once
+    num_frames is reached, before ever touching those files).
+
     FIX (carried over): depth chunk index i was computed from source video
     frame i*stride (DepthCrafter runs on a temporally-subsampled clip
     whenever stride > 1, i.e. whenever target_fps < source fps). This reads
@@ -1199,6 +1207,8 @@ def DepthSplatting(
     # many strided source frames exist.
     max_pairs_from_source = (native_num_frames + stride - 1) // stride
     num_frames = min(total_depth_frames, max_pairs_from_source)
+    if max_frames:
+        num_frames = min(num_frames, max_frames)
 
     print(f"==> splatting {num_frames} frames (stride={stride})")
     print(f"==> depth chunks: {len(chunk_files)}")
