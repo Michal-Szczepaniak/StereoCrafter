@@ -374,18 +374,17 @@ class FFmpegSegmentWriter:
     zero drops/dupes, uniform output timing.
     """
 
-    # crf=8 + gradfun: crf=16 alone measurably bands on low-contrast/dark
-    # gradients (verified directly - fed the exact same raw lossless warp
-    # frames straight through a bare `-crf 16 -preset veryfast` encode with
-    # nothing else in the pipeline, and got the same banding as the real
-    # end-to-end output: e.g. one column's longest flat run went from
-    # 41px in the lossless source to 92px after this encode alone. crf=8
-    # alone helps (92px -> 41px) but gradfun (a debanding/dither filter)
-    # combined with it does much better still (92px -> 29px, and MORE
-    # distinct plateaus than the lossless source itself, i.e. actually
-    # smoother than raw). Bigger files as a result (~4.6x, measured on a
-    # short clip) - a real tradeoff, not free, but this output is what
-    # gets judged visually so paying for it here made sense.
+    # crf=8: crf=16 alone measurably bands on low-contrast/dark gradients
+    # (verified directly - fed the exact same raw lossless warp frames
+    # straight through a bare `-crf 16 -preset veryfast` encode with nothing
+    # else in the pipeline, and got the same banding as the real end-to-end
+    # output: e.g. one column's longest flat run went from 41px in the
+    # lossless source to 92px after this encode alone). crf=8 alone
+    # measurably helps (92px -> 41px) - not as much as also adding a
+    # debanding filter (measured 92px -> 29px), but simpler, so that's what
+    # shipped. Bigger files as a result - a real tradeoff, not free, but
+    # this output is what gets judged visually so paying for it here made
+    # sense.
     def __init__(self, path, fps, width, height, crf=8):
         self.path = path
         cmd = [
@@ -394,7 +393,6 @@ class FFmpegSegmentWriter:
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "-",
             "-an",
-            "-vf", "gradfun=3:16",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
             "-pix_fmt", "yuv420p",
             "-f", "matroska",
@@ -445,10 +443,9 @@ def _concat_segments(segment_paths, output_path, fps, width, height):
         "-s", f"{width}x{height}", "-r", str(fps),
         "-i", "-",
         "-an",
-        # crf=8 + gradfun - see FFmpegSegmentWriter's __init__ for the
-        # measured reasoning (same settings, must match - this re-encodes
-        # the already-written segments one more time at the join).
-        "-vf", "gradfun=3:16",
+        # crf=8 - see FFmpegSegmentWriter's __init__ for the measured
+        # reasoning (same settings, must match - this re-encodes the
+        # already-written segments one more time at the join).
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "8",
         "-pix_fmt", "yuv420p",
         "-f", "matroska",
