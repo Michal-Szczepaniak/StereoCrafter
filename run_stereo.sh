@@ -110,6 +110,15 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 
+# Keep the depth checkpoint around after a successful run instead of
+# deleting it (both the per-chunk files as splatting consumes them, and the
+# whole .depth_checkpoint dir at the end) - for when you actually need to
+# inspect the raw depth data (e.g. checking whether DepthCrafter's own
+# output has banding/terracing in a low-texture region), not just resume a
+# failed run. Off by default since keeping it defeats the disk-usage point
+# of streaming chunks in the first place.
+KEEP_DEPTH_CHUNKS="${KEEP_DEPTH_CHUNKS:-False}"
+
 # ---- stage 2 (inpainting) knobs - these fit a 12GB card at 1080p; going
 # below tile_num=4, or raising decode_latents_chunk_size above 1, OOM at
 # full resolution (work_scale=1.0) on this card (verified). num_inference_steps
@@ -221,6 +230,7 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
+        --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \
         2>&1 | tee "$STAGE1_LOG"
 }
 

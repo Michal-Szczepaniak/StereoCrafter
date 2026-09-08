@@ -1435,6 +1435,7 @@ def main(
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 3,
     depth_only: bool = False,
+    keep_depth_chunks: bool = False,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -1553,13 +1554,17 @@ def main(
             store_params=store_params,
             compress_store=compress_store,
             disp_tolerance=disp_tolerance,
+            keep_depth_chunks=keep_depth_chunks,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")
         raise
     else:
-        print("==> removing depth checkpoint (run complete)")
-        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        if keep_depth_chunks:
+            print(f"==> keep_depth_chunks=True - depth checkpoint kept at {checkpoint_dir}")
+        else:
+            print("==> removing depth checkpoint (run complete)")
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     gc.collect()
     torch.cuda.empty_cache()
