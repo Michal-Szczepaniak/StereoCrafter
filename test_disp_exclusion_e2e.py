@@ -173,9 +173,15 @@ def run_splat(name: str, with_circle: bool) -> str:
         original_height=H,
         original_width=W,
         store_params={"max_disp": CHAR_MAX_DISP},
-        compress_store=False,
+        compress_store=True,
         disp_tolerance=1.0,
-        device="cpu",
+        # NOT "cpu": production's own main() never passes `device` to
+        # DepthSplatting() at all, relying on its default (device="cuda"),
+        # so real runs always use the compiled CUDA/HIP splat kernel, never
+        # the pure-Python CPU fallback. Omitting it here too, rather than
+        # hardcoding "cpu", so this test exercises the exact same code path
+        # production does instead of one that's never actually used for
+        # real - a real discrepancy this had, not just cosmetic.
         keep_depth_chunks=True,
         max_frames=None,
     )
