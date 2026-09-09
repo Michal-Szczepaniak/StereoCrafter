@@ -53,6 +53,11 @@ print(f"quantize round-trip max abs error: {err.max():.6f} (expect << 1)")
 assert err.max() < 1e-2
 
 # --- 3. _disp_exclusion_mask: synthetic hole with character on one side ---
+# search_px must be able to actually reach real background from the
+# farthest character pixel through the hole (here: column 0 -> column 20,
+# distance 20) - this uses the pipeline's real default (25) rather than an
+# arbitrary small radius, since a too-small radius is DOCUMENTED to fall
+# back to not excluding anything (verified separately below).
 T, Hh, Ww = 1, 20, 40
 disp_np = np.zeros((T, Hh, Ww), dtype=np.float32)
 disp_np[:, :, :15] = 10.0   # character (high disp)
@@ -60,7 +65,7 @@ disp_np[:, :, 15:] = 1.0    # background (low disp)
 hole_np = np.zeros((T, Hh, Ww), dtype=bool)
 hole_np[:, :, 15:20] = True  # the hole sits just past the character, in "background"
 
-excl = _disp_exclusion_mask(disp_np, hole_np, margin=1.0, search_px=10)
+excl = _disp_exclusion_mask(disp_np, hole_np, margin=1.0, search_px=25)
 # character pixels (valid, high disp, near the hole) should be excluded
 assert excl[:, :, 5:15].all(), "expected character-adjacent pixels to be excluded"
 # far background pixels (valid, low disp) should NOT be excluded
@@ -68,5 +73,14 @@ assert not excl[:, :, 25:].any(), "expected far background pixels to stay un-exc
 # hole pixels themselves are never marked (they're not valid sources anyway)
 assert not excl[hole_np].any()
 print("_disp_exclusion_mask: character excluded, background kept, holes untouched - OK")
+
+# search_px too small to reach real background from a given pixel: falls
+# back to NOT excluding there (documented behavior), rather than false-
+# positive-excluding based on an incomplete local view. Column 5 is 15px
+# from the nearest real background (column 20, through the 5px hole) -
+# unreachable at search_px=10.
+excl_small_radius = _disp_exclusion_mask(disp_np, hole_np, margin=1.0, search_px=10)
+assert not excl_small_radius[:, :, 5].any(), "expected too-far-to-reach-background pixel to NOT be excluded"
+print("_disp_exclusion_mask: too-small search_px correctly falls back to no exclusion - OK")
 
 print("ALL CHECKS PASSED")
