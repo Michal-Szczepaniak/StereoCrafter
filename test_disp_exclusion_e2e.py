@@ -102,15 +102,38 @@ MAX_RES = 768
 EDGE_THRESHOLD_FRAC = 0.10
 EDGE_FILL_ITERS = 3
 
-# Guided-filter refinement (prototype, not yet in production). radius/eps
-# are the two standard guided-filter knobs: radius sets how far the local
-# linear regression window reaches (must be at least a few px wider than
-# the low-res-grid's upsample ratio to actually see structure on both
-# sides of a staircase step), eps controls how strongly it trusts guide
-# edges vs. falling back to a plain local average (small eps = snap hard
-# to guide edges, large eps = ~equivalent to a plain box blur of depth).
+# Guided-filter refinement (prototype). Tested on real footage and judged
+# not worth its complexity - it can't distinguish a real depth boundary
+# from a pure ink line, and even band-gated it didn't visibly improve the
+# silhouette. Left in place but OFF, so it can't confound the
+# position-preserving-sharpen test below.
+GUIDED_FILTER_ENABLED = False
 GUIDED_FILTER_RADIUS = 8
 GUIDED_FILTER_EPS = 1e-3
+
+# Position-preserving sharpening - the alternative to _edge_threshold_fill.
+# "stretch": local contrast stretch about the local FG/BG midpoint, at FULL
+# res (see _position_preserving_sharpen). "edge_fill": the current
+# production behavior (_edge_threshold_fill), kept so the two can be A/B'd
+# in one run - main() splats BOTH and dumps a mask for each.
+SHARPEN_MODE = "stretch"
+# Window must reach the flat plateau on BOTH sides of the transition: the
+# ramp is ~(1-2 low-res px) x (upsample ratio) ~= 2.5-6 full-res px here,
+# so radius needs margin past that. Swept offline (numpy/scipy sim of this
+# exact scenario): results are IDENTICAL for radius 6, 8 and 12, and only
+# slightly worse at 4 - i.e. anything >= the ramp width works and this
+# knob barely needs tuning. Too large only risks spanning multiple
+# separate structures (thin hair strands etc.), so stay near the minimum.
+SHARPEN_RADIUS = 6
+# How hard to collapse the ramp. gain -> infinity is the classic
+# morphological "toggle contrast" operator (snap to whichever plateau is
+# closer). Swept offline: gain=3 narrows the edge from ~6.3px to ~1.8px
+# with LITERALLY ZERO positional cost (RMS 0.777 -> 0.777, jitter 0.1590
+# -> 0.1591 vs. not sharpening at all) - a free lunch. Past that you pay:
+# gain=6 gives a ~1.1px edge but +35% jitter, gain=12 +130%, toggle/inf
+# +265%. Since the comb IS a jitter artifact, 3 is the safe default;
+# raise it only if a ~1.8px soft edge proves too soft for the splat.
+SHARPEN_GAIN = 3.0
 
 
 def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int]:
@@ -124,6 +147,70 @@ def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int
         low_h = round(height * scale / 64) * 64
         low_w = round(width * scale / 64) * 64
     return low_h, low_w
+
+
+def _position_preserving_sharpen(depth: np.ndarray, radius: int, gain: float) -> np.ndarray:
+    """Re-hardens a soft depth transition WITHOUT moving where it sits.
+
+    The whole point (see the comb/aliasing investigation): a low-res depth
+    pixel that straddles a real silhouette gets a coverage-weighted blend
+    of the foreground and background depth - so its exact value encodes
+    the SUB-PIXEL position of the boundary inside that pixel, exactly the
+    way anti-aliasing works. _edge_threshold_fill discards that: it snaps
+    every low-res pixel to pure-FG or pure-BG, which forces the boundary
+    onto integer low-res pixel edges and MANUFACTURES the staircase whose
+    splat is the comb artifact.
+
+    This instead works on the full-res, bilinear-upsampled ramp (which
+    still carries that coverage information) and stretches contrast about
+    the LOCAL midpoint between the two plateaus:
+
+      local_lo/local_hi = grayscale erode/dilate = the background and
+        foreground plateau values on either side of the transition
+      level = their midpoint = the value corresponding to 50% coverage
+      out = clip((depth - level) * gain + level, local_lo, local_hi)
+
+    Properties that make this the right operator here:
+      - At the 50% crossing, depth == level, so the output is unchanged -
+        the boundary's position is preserved EXACTLY, at sub-low-res-pixel
+        precision, instead of being quantized to the grid.
+      - Over a linear gradient, a symmetric window's min and max average
+        to the center value, so depth - level == 0 and smooth background
+        depth ramps pass through completely untouched (no terracing).
+      - In flat regions local_lo == local_hi == depth, so it self-disables
+        rather than amplifying noise.
+      - Clamping to [local_lo, local_hi] prevents overshoot/ringing past
+        the true plateau values (which a plain unsharp mask would cause).
+
+    gain -> infinity is the classic morphological toggle-contrast operator
+    (snap to the nearer plateau); finite gain keeps a ~1-2px soft edge.
+
+    Validated offline against _edge_threshold_fill on this test's own
+    scenario (gradient background + circle, exact coverage downsample,
+    numpy/scipy sim - see the commit message). Boundary position RMS error
+    in full-res px, and mean outward shift ("halo"):
+
+        no sharpening (soft ramp)        RMS 1.30   shift +1.18
+        edge_fill iters=1                RMS 2.34   shift +2.25
+        edge_fill iters=3                RMS 4.43   shift +4.34
+        stretch (this, gain=3)           RMS 0.96   shift +0.87
+
+    The edge_fill numbers show what it actually IS on this content: a
+    plain 1px-per-iteration DILATION, not a sharpener. Its threshold is
+    global (min + frac*range), and with 85% of the frame sitting above
+    that threshold, essentially every pixel takes the max-of-neighbors
+    branch - including both sides of a real boundary, so it grows the
+    brighter side instead of snapping to the transition. That is exactly
+    the "aura/halo around characters" complaint that kicked off this whole
+    investigation, and why EDGE_FILL_ITERS had to be lowered to 1 to make
+    the mask hug characters at all.
+    """
+    k = 2 * radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    local_lo = cv2.erode(depth, kernel)
+    local_hi = cv2.dilate(depth, kernel)
+    level = 0.5 * (local_lo + local_hi)
+    return np.clip((depth - level) * gain + level, local_lo, local_hi)
 
 
 def _depth_boundary_band(depth_2d: np.ndarray, band_radius: int, rel_thresh: float = 0.02) -> np.ndarray:
@@ -193,41 +280,57 @@ def _guided_filter(guide_gray: np.ndarray, src: np.ndarray, radius: int, eps: fl
     return np.where(band, filtered, p)
 
 
-def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
-    """Replicates the exact transform chain real depth goes through in
+def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHARPEN_MODE) -> np.ndarray:
+    """Replicates the transform chain real depth goes through in
     depth_splatting_inference.py BEFORE it ever reaches DepthSplatting's
     splat step: (1) the depth model only ever sees/produces depth at a
     downscaled low-res resolution (get_video_info's own math, see
     _production_low_res), never at full source resolution; (2) that raw
-    low-res depth is upsampled to full resolution via BILINEAR (switched
-    from nearest - see depth_splatting_inference.py's call site comment:
-    bilinear linearly interpolates between adjacent low-res samples,
-    recovering some sub-low-res-pixel boundary position instead of
-    snapping to a blocky low-res-pixel step); (3) _edge_threshold_fill then
-    re-hardens that bilinear-softened edge on the FULL-RES result, not the
-    low-res one anymore.
+    low-res depth is upsampled to full resolution via BILINEAR, which
+    preserves the soft transition ramp (and with it the sub-low-res-pixel
+    boundary position encoded in it) instead of snapping to a blocky
+    low-res-pixel step the way nearest does; (3) the softened edge is
+    re-hardened, by whichever of the two operators `mode` selects.
+
+    mode="stretch" (_position_preserving_sharpen): re-hardens WITHOUT
+      moving the boundary - see that function's docstring.
+    mode="edge_fill" (_edge_threshold_fill): current production behavior,
+      which snaps to the low-res grid and so quantizes the boundary's
+      position. Kept for A/B comparison.
 
     This test hand-authors a depth map directly (no real DepthCrafter
     inference), so without the resolution round-trip here, the synthetic
     circle's boundary was analytically smooth at full 1080p, which no real
-    depth map ever is. Downscaling with INTER_AREA (not NEAREST/LINEAR)
-    so the low-res circle boundary starts genuinely soft/anti-aliased,
-    same as a real depth model's own softness at its native inference
-    resolution, rather than already artificially hard.
+    depth map ever is. Downscaling with INTER_AREA (not NEAREST/LINEAR) so
+    the low-res circle boundary starts genuinely soft/anti-aliased - and
+    note INTER_AREA is an exact coverage average, so in this test the soft
+    values ARE true sub-pixel coverage, which is precisely the information
+    "stretch" is supposed to preserve and "edge_fill" is supposed to
+    destroy. That makes this a decisive test of the hypothesis, not just a
+    qualitative look.
     """
     low_h, low_w = _production_low_res(H, W, MAX_RES)
     low_res = cv2.resize(depthnorm_full, (low_w, low_h), interpolation=cv2.INTER_AREA)
 
-    # threshold from the low-res range - bilinear upsampling can't produce
-    # values outside the range of the samples it interpolates between, so
-    # the low-res range equals the full-res range too (matches production).
-    threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
-        float(low_res.max()) - float(low_res.min())
-    )
     low_res_t = torch.from_numpy(low_res).unsqueeze(0).unsqueeze(0).float().cuda()
     upsampled_t = F.interpolate(low_res_t, size=(H, W), mode="bilinear", align_corners=False)
-    filled_t = _edge_threshold_fill(upsampled_t, threshold, EDGE_FILL_ITERS)
-    return filled_t[0, 0].cpu().numpy()
+
+    if mode == "stretch":
+        upsampled = upsampled_t[0, 0].cpu().numpy()
+        return _position_preserving_sharpen(upsampled, SHARPEN_RADIUS, SHARPEN_GAIN)
+
+    if mode == "edge_fill":
+        # threshold from the low-res range - bilinear upsampling can't
+        # produce values outside the range of the samples it interpolates
+        # between, so the low-res range equals the full-res range too
+        # (matches production).
+        threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
+            float(low_res.max()) - float(low_res.min())
+        )
+        filled_t = _edge_threshold_fill(upsampled_t, threshold, EDGE_FILL_ITERS)
+        return filled_t[0, 0].cpu().numpy()
+
+    raise ValueError(f"unknown sharpen mode {mode!r} - expected 'stretch' or 'edge_fill'")
 
 
 def _apply_guided_refinement(depthnorm_full: np.ndarray, guide_bgr: np.ndarray) -> np.ndarray:
@@ -290,38 +393,41 @@ def make_depthnorm(with_circle: bool) -> np.ndarray:
     return depthnorm
 
 
-def run_splat(name: str, with_circle: bool) -> str:
+def run_splat(name: str, with_circle: bool, mode: str = SHARPEN_MODE) -> str:
     """Builds the synthetic video + depth checkpoint for one variant and
-    runs the REAL DepthSplatting on it. Returns the splat store dir."""
+    runs the REAL DepthSplatting on it. Returns the splat store dir.
+    `mode` selects the re-hardening operator - see
+    _apply_production_depth_pipeline."""
     variant_dir = os.path.join(OUT_ROOT, name)
     os.makedirs(variant_dir, exist_ok=True)
 
     base = make_visual_gradient()
     source = make_source(base, with_circle)
     depthnorm_analytic = make_depthnorm(with_circle)
-    depthnorm_pipeline = _apply_production_depth_pipeline(depthnorm_analytic)
-    depthnorm = _apply_guided_refinement(depthnorm_pipeline, source)
+    depthnorm = _apply_production_depth_pipeline(depthnorm_analytic, mode)
     cv2.imwrite(os.path.join(variant_dir, "source.png"), source)
     cv2.imwrite(
         os.path.join(variant_dir, "depthnorm_pipeline.png"),
-        (np.clip(depthnorm_pipeline, 0.0, 1.0) * 255).astype(np.uint8),
-    )
-    cv2.imwrite(
-        os.path.join(variant_dir, "depthnorm_guided.png"),
         (np.clip(depthnorm, 0.0, 1.0) * 255).astype(np.uint8),
     )
+
+    if GUIDED_FILTER_ENABLED:
+        depthnorm = _apply_guided_refinement(depthnorm, source)
+        cv2.imwrite(
+            os.path.join(variant_dir, "depthnorm_guided.png"),
+            (np.clip(depthnorm, 0.0, 1.0) * 255).astype(np.uint8),
+        )
 
     video_path = os.path.join(variant_dir, "source.mkv")
     source_frames = np.stack([cv2.cvtColor(source, cv2.COLOR_BGR2RGB)] * NUM_FRAMES, axis=0)
     ffv1_encode(source_frames, video_path, "rgb24", W, H)
 
     depth_chunk_path = os.path.join(variant_dir, "depth_chunk_000.mkv")
-    # Clip before quantizing to uint16: the guided filter can overshoot
-    # slightly beyond [0,1] near strong edges (local linear-regression
-    # extrapolation, same ringing behavior as unsharp masking) - unlike
-    # plain interpolation, it isn't bounded by its input's own range.
-    # Without this a small negative value would silently wrap to a huge
-    # uint16 instead of erroring.
+    # Clip before quantizing to uint16 - a negative float would silently
+    # wrap to a huge uint16 rather than erroring. Both sharpen modes are
+    # already bounded (stretch clamps to [local_lo, local_hi]), but the
+    # guided filter is not (local linear-regression extrapolation can ring
+    # past its input's range, like unsharp masking), so this stays.
     depthnorm_clipped = np.clip(depthnorm, 0.0, 1.0)
     quantized = np.stack(
         [(depthnorm_clipped * DEPTH_QUANT_LEVELS).round().astype(np.uint16)] * NUM_FRAMES, axis=0
@@ -365,9 +471,22 @@ def main():
     os.makedirs(OUT_ROOT, exist_ok=True)
 
     splat_with = run_splat("with_circle", with_circle=True)
-    print(f"==> stage 1 (with circle) done -> {splat_with}")
+    print(f"==> stage 1 (with circle, sharpen={SHARPEN_MODE}) done -> {splat_with}")
     splat_without = run_splat("no_circle", with_circle=False)
     print(f"==> stage 1 (no circle, ground-truth reference) done -> {splat_without}")
+
+    # A/B the two re-hardening operators on the SAME scene, so the comb's
+    # presence/absence is attributable to that one variable and nothing
+    # else. Only the mask matters for this comparison (the comb is a
+    # stage-1 artifact, fully visible before any inpainting), so this
+    # extra run only needs its mask dumped, not a full stage-2 pass.
+    ab_mode = "edge_fill" if SHARPEN_MODE == "stretch" else "stretch"
+    splat_ab = run_splat(f"with_circle_{ab_mode}", with_circle=True, mode=ab_mode)
+    _warp_ab, mask_ab, _disp_ab, _meta_ab = open_store(splat_ab, mode="r")
+    cv2.imwrite(
+        os.path.join(OUT_ROOT, f"splat_mask_{ab_mode}.png"), np.array(mask_ab[0:1])[0]
+    )
+    print(f"==> stage 1 A/B comparison (sharpen={ab_mode}) done -> {splat_ab}")
 
     # Sanity check: the no-circle run should have essentially no holes of
     # its own (a gentle background gradient shouldn't self-occlude) - if it
@@ -470,7 +589,15 @@ def main():
     print()
     print(f"hole pixels: {hole_mask.sum()}")
     print(f"hole fill MAE vs. real no-circle warp (0-255 scale): {mae:.2f}")
-    print(f"see {OUT_ROOT}/ for with_circle/source.png, no_circle/source.png,")
+    print()
+    print("THE COMPARISON THAT MATTERS (comb is a stage-1 artifact, visible")
+    print("in the mask before any inpainting):")
+    print(f"    {OUT_ROOT}/splat_mask.png              <- sharpen={SHARPEN_MODE}")
+    print(f"    {OUT_ROOT}/splat_mask_{ab_mode}.png    <- sharpen={ab_mode}")
+    print("Smooth crescent edges = position preserved. Staircase/comb edges")
+    print("= boundary position quantized to the low-res grid.")
+    print()
+    print(f"also in {OUT_ROOT}/: with_circle/source.png, with_circle/depthnorm_pipeline.png,")
     print("    ground_truth.png, result_frame0.png, hole_diff.png")
 
 
