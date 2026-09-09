@@ -24,7 +24,7 @@ from diffusers import AutoencoderKLTemporalDecoder
 from diffusers import UNetSpatioTemporalConditionModel
 
 from pipelines.stereo_video_inpainting import StableVideoDiffusionInpaintingPipeline, tensor2vid
-from splat_store import open_store
+from splat_store import open_store, DEPTH_QUANT_LEVELS
 from chunked_attention import enable_chunked_attention
 
 
@@ -190,6 +190,41 @@ def _downscale_np(arr: np.ndarray, height: int, width: int) -> np.ndarray:
     out = np.empty((arr.shape[0], height, width) + arr.shape[3:], dtype=arr.dtype)
     for t in range(arr.shape[0]):
         out[t] = cv2.resize(arr[t], (width, height), interpolation=cv2.INTER_AREA)
+    return out
+
+
+def _disp_exclusion_mask(
+    disp_np: np.ndarray, hole_np: np.ndarray, margin: float, search_px: int
+) -> np.ndarray:
+    """disp_np: (T,H,W) float32 real (dequantized) disparity, destination
+    (right-eye) space. hole_np: (T,H,W) bool, True=hole. Returns (T,H,W)
+    bool: True on a VALID (non-hole) pixel whose disparity sits more than
+    `margin` above the local background disparity found within
+    `search_px` - i.e. foreground/character content that should not be
+    used as an inpainting SOURCE. See disp_exclude_margin/disp_bg_search_px
+    in main()'s docstring for the full reasoning.
+
+    Implementation: a hole pixel's own disp value is meaningless (leftover
+    near-zero-coverage noise - see ForwardWarpStereo.forward's docstring),
+    so hole pixels are set to a sentinel (effectively +inf) before a
+    per-frame grayscale erosion (= local minimum over a search_px-radius
+    neighborhood) - this makes the erosion answer "what's the lowest REAL
+    disparity within reach of this pixel", ignoring holes entirely. A
+    pixel deep inside a large foreground region (no real background within
+    search_px) naturally is NOT flagged, since its neighborhood minimum is
+    just other similarly-close foreground - this only fires right at a
+    genuine foreground/background transition, which is exactly the fringe
+    that leaks into hole fills."""
+    if search_px <= 0:
+        return np.zeros_like(hole_np, dtype=bool)
+    k = 2 * search_px + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    sentinel = np.float32(np.finfo(np.float32).max)
+    out = np.zeros(hole_np.shape, dtype=bool)
+    for t in range(disp_np.shape[0]):
+        filled = np.where(hole_np[t], sentinel, disp_np[t]).astype(np.float32)
+        local_bg = cv2.erode(filled, kernel)
+        out[t] = (~hole_np[t]) & (disp_np[t] > local_bg + margin)
     return out
 
 
@@ -502,14 +537,20 @@ def main(
     dump_frames=None,
     seed=None,
     hole_threshold=127,
+    disp_exclude_margin=1.0,
+    disp_bg_search_px=25,
 ):
     """NOTE: --input_video_path is now --splat_store_dir - point it at the
     directory depth_splatting_inference.py wrote (warp.npy + mask.npy +
-    meta.json), not an mp4.
+    disp.npy + meta.json, or the equivalent FFV1-compressed groups - see
+    splat_store.py), not an mp4. disp.npy may be absent (older store,
+    written before disp persistence existed) - source-exclusion is then
+    silently inactive, everything else works as before.
 
     This stage no longer touches the original video at all, or writes SBS /
-    anaglyph composites - it only ever reads warp.npy/mask.npy and produces
-    the generated right-eye video. Nothing here needs the source video: the
+    anaglyph composites - it only ever reads warp.npy/mask.npy(/disp.npy)
+    and produces the generated right-eye video. Nothing here needs the
+    source video: the
     diffusion pipeline is only ever conditioned on warp+mask, never on
     "left" - that was only read before to build the SBS/anaglyph previews in
     this same process. Combine the right-eye output with the original video
@@ -619,6 +660,37 @@ def main(
     catches nothing - confirmed empirically on this project's torch 2.13
     ROCm build (no triton installed): the call succeeds, then the first
     real forward pass crashes with torch._inductor.exc.TritonMissing.
+
+    disp_exclude_margin/disp_bg_search_px: EXPERIMENTAL disparity-based
+    source exclusion (see conversation history - character pixels leaking
+    into the hole fill because they're the nearest valid neighbor). Only
+    active if the splat store has disp_store data (see
+    depth_splatting_inference.py/splat_store.py - stores written before this
+    existed have disp_store=None and this is silently a no-op). Rationale:
+    a hole exists specifically because something nearer moved out of the
+    way of something farther, so the hole's correct fill is guaranteed to
+    have LOWER disparity than whatever's adjacent and caused it - no
+    foreground mask or dilation radius needed, just the disparity value
+    already computed for the warp.
+
+    For each hole, `disp_bg_search_px` sets how far out (in pixels) to look
+    for the true local background disparity (a grayscale erosion/local-min
+    over valid neighbors - genuine background is real which means it exists
+    at ALL, so it must be findable within this radius; too small and a wide
+    hole finds no real background and falls back to not excluding anything
+    there, too large and it starts picking up unrelated far-away depth
+    layers). Any valid (non-hole) neighbor pixel whose disparity exceeds
+    that local background value by more than `disp_exclude_margin` (same
+    units as max_disp; reuses the same slack concept as
+    depth_splatting_inference.py's DISP_TOLERANCE) is treated as
+    foreground/character content for source purposes ONLY: it gets unioned
+    into a separate "generation mask" fed to the TELEA prefill and the
+    diffusion model's conditioning (so neither ever sees/sources from it),
+    while the actual hole mask used for final compositing (mask_out/
+    full_mask) is untouched - the character's REAL pixels always end up in
+    the output, exactly as before. This is why it doesn't produce the halo
+    a blind mask-dilation approach would: only the SOURCE pool for
+    generation grows, never the region that gets overwritten.
 
     bench_iters/bench_start/dump_frames: benchmarking harness for A/B'ing
     every option above against a real splat store without touching the real
@@ -732,7 +804,11 @@ def main(
     # thousands of frames - this is the same "no full video in RAM" guarantee
     # a chunked video reader had, just without a video codec, and without
     # needing to read the source video at all anymore).
-    warp_store, mask_store, meta = open_store(splat_store_dir, mode="r")
+    warp_store, mask_store, disp_store, meta = open_store(splat_store_dir, mode="r")
+    # max_disp: only needed to dequantize disp_store (uint16, see
+    # splat_store.create_store's docstring) - a store written before disp
+    # persistence existed has disp_store=None and max_disp is simply unused.
+    disp_max = meta.get("params", {}).get("max_disp")
     num_frames = warp_store.shape[0]
     # height/width: the REAL output resolution - every pixel of the source
     # frame, never cropped.
@@ -785,6 +861,8 @@ def main(
         "mask_skip_threshold": mask_skip_threshold,
         "classical_only": classical_only,
         "prefill_occlusion": prefill_occlusion,
+        "disp_exclude_margin": disp_exclude_margin,
+        "disp_bg_search_px": disp_bg_search_px,
         "vae_encode_chunk_size": vae_encode_chunk_size,
         "num_frames": num_frames,
         "width": width,
@@ -863,14 +941,22 @@ def main(
             (padded_height, padded_width). At work_scale<1.0, downscaled
             (aspect-preserving) to (work_height_raw, work_width_raw),
             prefilled AT that resolution, then padded to (work_height,
-            work_width).
+            work_width). If disp-based source exclusion is active (see
+            disp_exclude_margin/disp_bg_search_px), model_mask/model_warp
+            are built from gen_mask - a WIDER mask than the real hole - so
+            the model never sees/sources from excluded content.
         - full_mask/full_warp: ALWAYS full resolution, padded to
           (padded_height, padded_width), used for the final composite and
-          for cropping back to (height, width). At work_scale=1.0 these are
-          literally the same tensors as model_mask/model_warp (no extra
-          work). At work_scale<1.0, full_warp is deliberately the RAW
-          (un-prefilled) warp, not a second full-res TELEA pass: the
-          composite gate below only ever pulls generated content into
+          for cropping back to (height, width), and ALWAYS built from the
+          real, tight hole mask (mask_np) - never gen_mask. This is what
+          keeps source-exclusion from producing a halo: only the pool of
+          pixels the model is allowed to draw FROM grows, never the region
+          that ends up overwritten in the output. At work_scale=1.0 with no
+          active exclusion these collapse to the same tensors as
+          model_mask/model_warp (no extra work, matches previous
+          behavior exactly). At work_scale<1.0, full_warp is deliberately
+          the RAW (un-prefilled) warp, not a second full-res TELEA pass:
+          the composite gate below only ever pulls generated content into
           pixels where full_mask is actually a hole, so everywhere else -
           where full_warp is used - is already a correct reprojected pixel,
           and a second prefill pass there would just be discarded work.
@@ -904,14 +990,28 @@ def main(
         if pad_bottom or pad_right:
             full_mask = F.pad(full_mask, (0, pad_right, 0, pad_bottom), mode="replicate")
 
+        # gen_mask_np: see disp_exclude_margin/disp_bg_search_px in main()'s
+        # docstring. Stays IDENTICAL (same array object) to mask_np unless a
+        # disp store is actually present and the feature is enabled -
+        # everything below then takes the exact original code path.
+        gen_mask_np = mask_np
+        if disp_store is not None and disp_max and disp_bg_search_px > 0:
+            disp_u16 = np.array(disp_store[start:end], copy=True)
+            disp_np = (
+                disp_u16.astype(np.float32) / DEPTH_QUANT_LEVELS * (2.0 * disp_max) - disp_max
+            )
+            hole_bool = mask_np > 127
+            exclude_bool = _disp_exclusion_mask(disp_np, hole_bool, disp_exclude_margin, disp_bg_search_px)
+            gen_mask_np = np.where(hole_bool | exclude_bool, 255, 0).astype(np.uint8)
+
         if work_scale != 1.0:
             warp_small_np = _downscale_np(warp_np, work_height_raw, work_width_raw)
-            mask_small_np = _downscale_np(mask_np, work_height_raw, work_width_raw)
+            gen_mask_small_np = _downscale_np(gen_mask_np, work_height_raw, work_width_raw)
             if prefill_occlusion:
-                warp_small_np = _prefill_occlusion(warp_small_np, mask_small_np)
+                warp_small_np = _prefill_occlusion(warp_small_np, gen_mask_small_np)
 
             model_warp = torch.from_numpy(warp_small_np).permute(0, 3, 1, 2).float() / 255.0
-            model_mask = torch.from_numpy(mask_small_np).float().unsqueeze(1) / 255.0
+            model_mask = torch.from_numpy(gen_mask_small_np).float().unsqueeze(1) / 255.0
             if work_pad_bottom or work_pad_right:
                 model_warp = F.pad(model_warp, (0, work_pad_right, 0, work_pad_bottom), mode="replicate")
                 model_mask = F.pad(model_mask, (0, work_pad_right, 0, work_pad_bottom), mode="replicate")
@@ -920,13 +1020,39 @@ def main(
             if pad_bottom or pad_right:
                 full_warp = F.pad(full_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
         else:
-            if prefill_occlusion:
-                warp_np = _prefill_occlusion(warp_np, mask_np)
-            model_warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
+            full_warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
             if pad_bottom or pad_right:
-                model_warp = F.pad(model_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
-            model_mask = full_mask
-            full_warp = model_warp
+                full_warp = F.pad(full_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
+
+            if gen_mask_np is mask_np:
+                # No active source-exclusion: original behavior exactly -
+                # model conditioning IS the full-res tight-hole path, and
+                # full_warp/model_mask alias the same tensors (no extra
+                # compute).
+                if prefill_occlusion:
+                    warp_np = _prefill_occlusion(warp_np, mask_np)
+                model_warp = torch.from_numpy(warp_np).permute(0, 3, 1, 2).float() / 255.0
+                if pad_bottom or pad_right:
+                    model_warp = F.pad(model_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
+                model_mask = full_mask
+                full_warp = model_warp
+            else:
+                # Source-exclusion active: the model conditions on a WIDER
+                # prefill (gen_mask_np) than the composite is gated by
+                # (full_mask, still mask_np) - full_warp above (built from
+                # the untouched warp_np) must NOT be reassigned to this, or
+                # the character's real pixels would get replaced by the
+                # union-mask prefill everywhere the composite gate treats as
+                # "not a hole".
+                model_warp_np = warp_np
+                if prefill_occlusion:
+                    model_warp_np = _prefill_occlusion(warp_np, gen_mask_np)
+                model_warp = torch.from_numpy(model_warp_np).permute(0, 3, 1, 2).float() / 255.0
+                if pad_bottom or pad_right:
+                    model_warp = F.pad(model_warp, (0, pad_right, 0, pad_bottom), mode="replicate")
+                model_mask = torch.from_numpy(gen_mask_np).float().unsqueeze(1) / 255.0
+                if pad_bottom or pad_right:
+                    model_mask = F.pad(model_mask, (0, pad_right, 0, pad_bottom), mode="replicate")
 
         return model_mask, model_warp, full_mask, full_warp
 

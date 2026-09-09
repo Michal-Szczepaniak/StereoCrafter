@@ -173,6 +173,13 @@ MAX_ITERS="${MAX_ITERS:-}"
 # you lower TILE_NUM on hardware that needs it. Set to False to force the
 # old (crash-prone at low TILE_NUM on this hardware) behavior, e.g. to A/B
 # it yourself.
+# EXPERIMENTAL disparity-based source exclusion for stage 2's inpainting -
+# see inpainting_inference.py's main() docstring (disp_exclude_margin/
+# disp_bg_search_px) for the full reasoning. Auto-inactive on any splat
+# store without disp data (i.e. one written before this existed) -
+# DISP_BG_SEARCH_PX=0 also disables it explicitly on a store that has it.
+DISP_EXCLUDE_MARGIN="${DISP_EXCLUDE_MARGIN:-1.0}"
+DISP_BG_SEARCH_PX="${DISP_BG_SEARCH_PX:-25}"
 CHUNKED_ATTENTION="${CHUNKED_ATTENTION:-True}"
 ATTENTION_KV_CHUNK_SIZE="${ATTENTION_KV_CHUNK_SIZE:-1024}"
 VAE_ENCODE_CHUNK_SIZE="${VAE_ENCODE_CHUNK_SIZE:-5}"
@@ -278,6 +285,8 @@ stage2_run() {
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \
         --suppress_attention_kernel_warnings="$SUPPRESS_ATTENTION_KERNEL_WARNINGS" \
         --vae_encode_chunk_size="$VAE_ENCODE_CHUNK_SIZE" \
+        --disp_exclude_margin="$DISP_EXCLUDE_MARGIN" \
+        --disp_bg_search_px="$DISP_BG_SEARCH_PX" \
         --resume="$RESUME" \
         "${MAX_ITERS_ARG[@]}" \
         2>&1 | tee "$STAGE2_LOG"

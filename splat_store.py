@@ -16,10 +16,11 @@ format had three problems:
      second generation-loss hit too, on top of whatever the source video's
      own encoding already cost it.
 
-This module stores only what the inpaint stage reads: the warped (right-eye)
-image and the occlusion mask. "left" is not duplicated here - the inpaint
-stage reads it directly from the original source video (path recorded in
-meta.json).
+This module stores what the inpaint stage reads: the warped (right-eye)
+image, the occlusion mask, and (optionally - see disp below) the warped
+disparity used for disparity-based inpainting source-exclusion. "left" is
+not duplicated here - the inpaint stage reads it directly from the original
+source video (path recorded in meta.json).
 
 Two on-disk formats, chosen via create_store(..., compress=...):
 
@@ -82,11 +83,21 @@ from numpy.lib.format import open_memmap
 
 WARP_FILENAME = "warp.npy"
 MASK_FILENAME = "mask.npy"
+DISP_FILENAME = "disp.npy"
 META_FILENAME = "meta.json"
+
+# Shared uint16 quantization step for both the depth checkpoint (used
+# pre-splat, in depth_splatting_inference.py's DepthCrafterDemo.infer) and
+# the disp store above (post-splat, destination-space) - one source of
+# truth so a writer/reader pair can't drift out of sync on the divisor.
+# Quantization step is (value range)/65535, e.g. a factor of ~6500x finer
+# than a 0.0001 error tolerance on a depth range of ~1.0.
+DEPTH_QUANT_LEVELS = 65535
 
 # FFV1 group filenames: "<prefix>_<group_index>.mkv" + "<prefix>_index.json"
 WARP_PREFIX = "warp"
 MASK_PREFIX = "mask"
+DISP_PREFIX = "disp"
 
 _FFV1_CACHE_GROUPS = 2  # decoded groups kept resident - see module docstring
 
@@ -167,13 +178,13 @@ class _CompressedWriter:
     same OOM shape as everything else fixed this session) - without
     stalling the caller on each ffmpeg subprocess launch."""
 
-    def __init__(self, store_dir, prefix, height, width, channels):
+    def __init__(self, store_dir, prefix, height, width, channels, pix_fmt=None):
         self._store_dir = store_dir
         self._prefix = prefix
         self._height = height
         self._width = width
         self._channels = channels
-        self._pix_fmt = "rgb24" if channels == 3 else "gray"
+        self._pix_fmt = pix_fmt if pix_fmt is not None else ("rgb24" if channels == 3 else "gray")
         self._buffer = []
         self._next_frame = 0
         self._group_index = 0
@@ -241,13 +252,14 @@ class _CompressedWriter:
 
 
 class _CompressedReader:
-    def __init__(self, store_dir, prefix, num_frames, height, width, channels):
+    def __init__(self, store_dir, prefix, num_frames, height, width, channels, pix_fmt=None, dtype=np.uint8):
         self._store_dir = store_dir
         self._prefix = prefix
         self._height = height
         self._width = width
         self._channels = channels
-        self._pix_fmt = "rgb24" if channels == 3 else "gray"
+        self._pix_fmt = pix_fmt if pix_fmt is not None else ("rgb24" if channels == 3 else "gray")
+        self._dtype = dtype
         self.shape = (num_frames, height, width, channels) if channels else (num_frames, height, width)
 
         index_path = os.path.join(store_dir, f"{prefix}_index.json")
@@ -267,7 +279,7 @@ class _CompressedReader:
                 self._cache.pop(next(iter(self._cache)))
             path = os.path.join(self._store_dir, g["file"])
             self._cache[g["file"]] = ffv1_decode(
-                path, self._pix_fmt, self._width, self._height, self._channels
+                path, self._pix_fmt, self._width, self._height, self._channels, dtype=self._dtype
             )
         return self._cache[g["file"]]
 
@@ -289,13 +301,20 @@ class _CompressedReader:
 def create_store(store_dir, num_frames, height, width, compress=True):
     """Preallocate/prepare the on-disk store for writing.
 
-    Returns (warp, mask). Assigning into a contiguous slice (e.g.
+    Returns (warp, mask, disp). Assigning into a contiguous slice (e.g.
     warp[10:20] = ...) writes only that slice.
 
+    disp: destination-space (right-eye) disparity, uint16-quantized (same
+    scheme as the depth checkpoint's own DEPTH_QUANT_LEVELS, see
+    depth_splatting_inference.py - callers of this store dequantize using
+    meta["params"]["max_disp"]). Only meaningful where mask says a pixel is
+    NOT a hole - a hole's disp value is leftover near-zero-coverage noise,
+    not real data (see ForwardWarpStereo.forward's docstring).
+
     compress=True (default): FFV1-backed, see module docstring. Caller MUST
-    call warp.close() and mask.close() once after all writes are done (not
-    just the per-chunk .flush() calls) to write the group index - see
-    DepthSplatting's use of this.
+    call warp.close(), mask.close() and disp.close() once after all writes
+    are done (not just the per-chunk .flush() calls) to write the group
+    index - see DepthSplatting's use of this.
     compress=False: the original raw memmap format - no .close() needed
     (numpy flushes via .flush(), same as before).
     """
@@ -303,7 +322,8 @@ def create_store(store_dir, num_frames, height, width, compress=True):
     if compress:
         warp = _CompressedWriter(store_dir, WARP_PREFIX, height, width, channels=3)
         mask = _CompressedWriter(store_dir, MASK_PREFIX, height, width, channels=None)
-        return warp, mask
+        disp = _CompressedWriter(store_dir, DISP_PREFIX, height, width, channels=None, pix_fmt="gray16le")
+        return warp, mask, disp
 
     warp = open_memmap(
         os.path.join(store_dir, WARP_FILENAME),
@@ -317,7 +337,13 @@ def create_store(store_dir, num_frames, height, width, compress=True):
         dtype=np.uint8,
         shape=(num_frames, height, width),
     )
-    return warp, mask
+    disp = open_memmap(
+        os.path.join(store_dir, DISP_FILENAME),
+        mode="w+",
+        dtype=np.uint16,
+        shape=(num_frames, height, width),
+    )
+    return warp, mask, disp
 
 
 def write_meta(store_dir, **meta):
@@ -332,9 +358,12 @@ def open_store(store_dir, mode="r"):
     (warp.npy vs warp_index.json) - callers don't need to know which one a
     given store used.
 
-    Returns (warp, mask, meta_dict). For the raw format shape/dtype come
-    from each .npy file's own header; for the compressed format, from
-    meta.json's num_frames/height/width (required in that case).
+    Returns (warp, mask, disp, meta_dict). `disp` is None for a store
+    written before disp persistence existed (backward-compat - callers must
+    handle disp is None by falling back to not having a source-exclusion
+    signal). For the raw format shape/dtype come from each .npy file's own
+    header; for the compressed format, from meta.json's
+    num_frames/height/width (required in that case).
     """
     meta_path = os.path.join(store_dir, META_FILENAME)
     meta = {}
@@ -345,7 +374,9 @@ def open_store(store_dir, mode="r"):
     if os.path.exists(os.path.join(store_dir, WARP_FILENAME)):
         warp = open_memmap(os.path.join(store_dir, WARP_FILENAME), mode=mode)
         mask = open_memmap(os.path.join(store_dir, MASK_FILENAME), mode=mode)
-        return warp, mask, meta
+        disp_path = os.path.join(store_dir, DISP_FILENAME)
+        disp = open_memmap(disp_path, mode=mode) if os.path.exists(disp_path) else None
+        return warp, mask, disp, meta
 
     index_path = os.path.join(store_dir, f"{WARP_PREFIX}_index.json")
     if not os.path.exists(index_path):
@@ -363,4 +394,11 @@ def open_store(store_dir, mode="r"):
     num_frames, height, width = meta["num_frames"], meta["height"], meta["width"]
     warp = _CompressedReader(store_dir, WARP_PREFIX, num_frames, height, width, channels=3)
     mask = _CompressedReader(store_dir, MASK_PREFIX, num_frames, height, width, channels=None)
-    return warp, mask, meta
+    disp_index_path = os.path.join(store_dir, f"{DISP_PREFIX}_index.json")
+    disp = None
+    if os.path.exists(disp_index_path):
+        disp = _CompressedReader(
+            store_dir, DISP_PREFIX, num_frames, height, width, channels=None,
+            pix_fmt="gray16le", dtype=np.uint16,
+        )
+    return warp, mask, disp, meta

@@ -20,7 +20,7 @@ from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTempora
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 
 from Forward_Warp import forward_warp
-from splat_store import create_store, open_store, write_meta, ffv1_encode, ffv1_decode
+from splat_store import create_store, open_store, write_meta, ffv1_encode, ffv1_decode, DEPTH_QUANT_LEVELS
 
 # TF32 + cudnn.benchmark: no accuracy-relevant impact on this workload (TF32's
 # 19-bit mantissa vs fp32's 23-bit is inconsequential against an already-noisy
@@ -40,10 +40,6 @@ if torch.cuda.is_available():
     # amortizing one cached choice. Do not re-enable without re-verifying
     # end-to-end wall time, not just a single op's microbenchmark.
     # torch.backends.cudnn.benchmark = True
-
-DEPTH_QUANT_LEVELS = 65535  # uint16 - quantization step is (chunk range)/65535,
-                             # e.g. a factor of ~6500x finer than a 0.0001 error
-                             # tolerance on a depth range of ~1.0
 
 
 def _format_duration(seconds: float) -> str:
@@ -234,7 +230,7 @@ def _store_is_complete(store_dir, expected_params):
     if os.path.exists(checkpoint_dir):
         return False
     try:
-        warp, mask, meta = open_store(store_dir, mode="r")
+        warp, mask, disp, meta = open_store(store_dir, mode="r")
     except (FileNotFoundError, ValueError):
         return False
     if meta.get("params") != expected_params:
@@ -243,6 +239,11 @@ def _store_is_complete(store_dir, expected_params):
     return (
         warp.shape == (num_frames, height, width, 3)
         and mask.shape == (num_frames, height, width)
+        # disp is None for a store written before disp persistence existed -
+        # not "complete" by this codebase's standard even if params/warp/
+        # mask otherwise match, since inpainting's source-exclusion needs it.
+        and disp is not None
+        and disp.shape == (num_frames, height, width)
     )
 
 
@@ -1100,14 +1101,28 @@ class ForwardWarpStereo(nn.Module):
         occlu_map = occlu_map.unsqueeze(1)
         return res, occlu_map
 
-    def forward(self, im, disp):
+    def forward(self, im, disp, extra=None):
+        """extra: optional [B,K,H,W] tensor of additional per-pixel channels
+        to warp through the EXACT same splat (same flow, same z-buffer
+        gating, same near-bias weights) as `im` - e.g. passing `disp` itself
+        as `extra` gives you the destination-space (right-eye) disparity
+        map, with holes landing at exactly the same pixels as `im`'s and
+        occlu_map's, since it's the identical scatter. Both splat paths
+        below are already channel-count-agnostic (C is read from the
+        concatenated tensor's own shape), so this just concatenates onto
+        `im` before the split and slices the extra channels back off after -
+        no change to the splat math itself. Returned as an extra trailing
+        element of the tuple, only when `extra` is passed, so existing
+        callers that don't pass it see no change in return shape."""
         im = im.contiguous()
         disp = disp.contiguous()
 
+        im_in = im if extra is None else torch.cat([im, extra.contiguous()], dim=1)
+
         if self.use_zbuffer_splat:
-            res, occlu_map = self._zbuffer_splat(im, disp)
+            res_full, occlu_map = self._zbuffer_splat(im_in, disp)
         else:
-            res, occlu_map = self._forward_legacy_cuda_splat(im, disp)
+            res_full, occlu_map = self._forward_legacy_cuda_splat(im_in, disp)
 
         # DISABLED: _close_cracks doesn't exist in upstream StereoCrafter at
         # all (added later, this project's own "Optimizations" commit) - and
@@ -1121,10 +1136,18 @@ class ForwardWarpStereo(nn.Module):
         # behavior instead of stacking unproven tweaks on top of it.
         # res, occlu_map = self._close_cracks(res, occlu_map)
 
-        if not self.occlu_map:
-            return res
+        if extra is None:
+            res, res_extra = res_full, None
         else:
+            c = im.shape[1]
+            res, res_extra = res_full[:, :c], res_full[:, c:]
+
+        if not self.occlu_map:
+            return res if extra is None else (res, res_extra)
+        elif extra is None:
             return res, occlu_map
+        else:
+            return res, occlu_map, res_extra
 
 
 def DepthSplatting(
@@ -1224,7 +1247,7 @@ def DepthSplatting(
             f"the resolution depth was computed/resized at {(original_height, original_width)}"
         )
 
-    warp_store, mask_store = create_store(store_dir, num_frames, height, width, compress=compress_store)
+    warp_store, mask_store, disp_store = create_store(store_dir, num_frames, height, width, compress=compress_store)
     write_meta(
         store_dir,
         fps=target_fps,
@@ -1236,7 +1259,7 @@ def DepthSplatting(
         params=store_params,
     )
     print(f"==> writing splat store to: {store_dir}")
-    print(f"==> ({num_frames} x {height} x {width}) warp uint8 + mask uint8, no grid, no depth-vis")
+    print(f"==> ({num_frames} x {height} x {width}) warp uint8 + mask uint8 + disp uint16, no grid, no depth-vis")
 
     # use_zbuffer_splat=False: matches upstream's original legacy CUDA blend
     # path (see ForwardWarpStereo._forward_legacy_cuda_splat). The z-buffer
@@ -1343,11 +1366,13 @@ def DepthSplatting(
             disp_map = disp_map * max_disp
 
             with torch.no_grad():
-                right_video, occlusion_mask = stereo_projector(left_video, disp_map)
+                right_video, occlusion_mask, right_disp = stereo_projector(
+                    left_video, disp_map, extra=disp_map
+                )
 
-            # OPTIMIZATION: write only the two arrays the inpaint stage
-            # reads - no grid assembly, no depth-vis channel, no 3x
-            # replication of a single-channel mask, no color-space convert.
+            # OPTIMIZATION: write only the arrays the inpaint stage reads -
+            # no grid assembly, no depth-vis channel, no 3x replication of a
+            # single-channel mask, no color-space convert.
             right_u8 = (
                 right_video.clamp(0, 1).mul(255).to(torch.uint8)
                 .permute(0, 2, 3, 1).contiguous().cpu().numpy()
@@ -1356,24 +1381,43 @@ def DepthSplatting(
                 occlusion_mask.clamp(0, 1).mul(255).to(torch.uint8)
                 .squeeze(1).contiguous().cpu().numpy()
             )
+            # right_disp: destination-space (right-eye) disparity, same
+            # units as disp_map ([-max_disp, max_disp]) - quantized to
+            # uint16 same as the depth checkpoint (DEPTH_QUANT_LEVELS)
+            # rather than stored as float32, to not double the store's disk
+            # footprint. Values at hole pixels are meaningless (near-zero
+            # coverage divided out, see _forward_legacy_cuda_splat's
+            # mask.clamp_(min=eps)) - inpainting_inference.py must only ever
+            # read this where the occlusion mask says the pixel is valid.
+            disp_norm = (
+                (right_disp.squeeze(1).clamp(-max_disp, max_disp) + max_disp)
+                / (2 * max_disp) * DEPTH_QUANT_LEVELS
+            )
+            disp_u16 = (
+                disp_norm.round().clamp(0, DEPTH_QUANT_LEVELS).to(torch.int32)
+                .contiguous().cpu().numpy().astype(np.uint16)
+            )
 
             warp_store[sample_start : sample_start + n] = right_u8
             mask_store[sample_start : sample_start + n] = mask_u8
+            disp_store[sample_start : sample_start + n] = disp_u16
 
             del (
                 batch_frames, batch_depth, left_video, disp_map,
-                right_video, occlusion_mask, right_u8, mask_u8,
+                right_video, occlusion_mask, right_disp, right_u8, mask_u8, disp_u16,
             )
 
             if batch_num % FLUSH_EVERY_N_BATCHES == 0:
                 warp_store.flush()
                 mask_store.flush()
+                disp_store.flush()
 
         # Final flush for whatever's left over (chunk_frames isn't
         # necessarily a multiple of batch_size*FLUSH_EVERY_N_BATCHES), and
         # release GPU memory before starting the next depth chunk.
         warp_store.flush()
         mask_store.flush()
+        disp_store.flush()
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -1398,12 +1442,15 @@ def DepthSplatting(
 
     warp_store.flush()
     mask_store.flush()
+    disp_store.flush()
     # Compressed writer: final flush + write the group index (no-op for the
     # raw memmap format, which has no .close()).
     if hasattr(warp_store, "close"):
         warp_store.close()
     if hasattr(mask_store, "close"):
         mask_store.close()
+    if hasattr(disp_store, "close"):
+        disp_store.close()
 
     print("==> Depth splatting complete.")
     print(f"==> wrote: {store_dir}")
