@@ -35,27 +35,36 @@ from depth_splatting_inference import DepthSplatting
 from splat_store import ffv1_encode, DEPTH_QUANT_LEVELS
 import inpainting_inference
 
-H = 768
+# Real 1080p, matching the actual content this pipeline runs on - resolution
+# changes real behavior here (e.g. work_scale/64-padding, the comb/notch
+# fix's own docstring notes the halo's low-res-pixel width differs between
+# max_res=384 and 768), so a synthetic canvas smaller than real footage
+# risks validating something that doesn't transfer.
+H, W = 1080, 1920
 NUM_FRAMES = 4
 BG_DEPTHNORM = 0.5    # depthnorm=0.5 -> disp=(0.5*2-1)*max_disp=0 -> background never moves
 CIRCLE_DEPTHNORM = 1.0  # depthnorm=1.0 -> disp=+max_disp -> circle moves left by max_disp
 
 # Circle diameter = 70% of H (for spotting artifacts more easily) - the
-# shift distance and canvas width scale WITH it, not independently: the
-# whole "hole == exactly the pre-circle gradient" ground truth depends on
-# the shifted circle landing fully clear of the original footprint (no
-# overlap, or the hole degenerates into a partial crescent instead of a
-# full clean disk). SHIFT_PX must exceed the diameter; GAP just keeps a
-# visibly empty band between the two footprints so it's obvious in the
-# dumped PNGs which is which. W is sized to comfortably fit both circles
-# plus margin, computed from these instead of hardcoded.
+# shift distance scales WITH it, not independently: the whole "hole ==
+# exactly the pre-circle gradient" ground truth depends on the shifted
+# circle landing fully clear of the original footprint (no overlap, or the
+# hole degenerates into a partial crescent instead of a full clean disk).
+# SHIFT_PX must exceed the diameter; GAP just keeps a visibly empty band
+# between the two footprints so it's obvious in the dumped PNGs which is
+# which.
 CIRCLE_R = round(0.35 * H)
 GAP = max(10, CIRCLE_R // 2)
 SHIFT_PX = 2 * CIRCLE_R + GAP
 MAX_DISP = SHIFT_PX  # circle disp == max_disp -> exactly SHIFT_PX of movement
 MARGIN = 20
-W = SHIFT_PX + 2 * CIRCLE_R + 2 * MARGIN
 CIRCLE_CENTER = (H // 2, W - CIRCLE_R - MARGIN)  # near the right edge, shifts left into frame
+
+_min_w_needed = SHIFT_PX + 2 * CIRCLE_R + 2 * MARGIN
+assert W >= _min_w_needed, (
+    f"W={W} too small to fit the original+shifted circle footprints with margin "
+    f"(need >= {_min_w_needed}) - shrink CIRCLE_R's fraction of H or widen W"
+)
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
 
