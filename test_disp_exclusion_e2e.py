@@ -37,8 +37,10 @@ import shutil
 
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 
-from depth_splatting_inference import DepthSplatting
+from depth_splatting_inference import DepthSplatting, _edge_threshold_fill
 from splat_store import ffv1_encode, open_store, DEPTH_QUANT_LEVELS
 import inpainting_inference
 from inpainting_inference import _disp_exclusion_mask
@@ -91,6 +93,59 @@ assert CIRCLE_CENTER[1] - CIRCLE_R >= 0 and CIRCLE_CENTER[1] + CIRCLE_R <= W, (
 BG_DISP_LO, BG_DISP_HI = -10.0, 10.0
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
+
+# Real production defaults (depth_splatting_inference.py's DepthSplatting/
+# main() signatures) - the low-res-compute -> edge-threshold-fill ->
+# nearest-upsample pipeline this test now replicates uses these exact
+# values, not placeholders.
+MAX_RES = 768
+EDGE_THRESHOLD_FRAC = 0.10
+EDGE_FILL_ITERS = 3
+
+
+def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int]:
+    """Mirrors get_video_info's own resize math exactly (round-to-64,
+    only downscale if over max_res) - this is what DepthCrafter's real
+    low-res inference resolution actually is for a given source size."""
+    low_h = round(height / 64) * 64
+    low_w = round(width / 64) * 64
+    if max(low_h, low_w) > max_res:
+        scale = max_res / max(height, width)
+        low_h = round(height * scale / 64) * 64
+        low_w = round(width * scale / 64) * 64
+    return low_h, low_w
+
+
+def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
+    """Replicates the exact transform chain real depth goes through in
+    depth_splatting_inference.py BEFORE it ever reaches DepthSplatting's
+    splat step: (1) the depth model only ever sees/produces depth at a
+    downscaled low-res resolution (get_video_info's own math, see
+    _production_low_res), never at full source resolution; (2)
+    _edge_threshold_fill runs on that raw low-res depth; (3) the result is
+    upsampled back to full resolution via nearest-neighbor (never
+    bilinear/bicubic - confirmed in DepthCrafterDemo.infer()).
+
+    This test hand-authors a depth map directly (no real DepthCrafter
+    inference), so without this step it was skipping the entire
+    resolution round-trip that real footage always goes through - the
+    synthetic circle's boundary was analytically smooth at full 1080p,
+    which no real depth map ever is. Downscaling with INTER_AREA (not
+    NEAREST/LINEAR) before the fill so the low-res circle boundary starts
+    genuinely soft/anti-aliased, same as a real depth model's own softness
+    at its native inference resolution, rather than already artificially
+    hard.
+    """
+    low_h, low_w = _production_low_res(H, W, MAX_RES)
+    low_res = cv2.resize(depthnorm_full, (low_w, low_h), interpolation=cv2.INTER_AREA)
+
+    threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
+        float(low_res.max()) - float(low_res.min())
+    )
+    low_res_t = torch.from_numpy(low_res).unsqueeze(0).unsqueeze(0).float().cuda()
+    filled_t = _edge_threshold_fill(low_res_t, threshold, EDGE_FILL_ITERS)
+    upsampled_t = F.interpolate(filled_t, size=(H, W), mode="nearest")
+    return upsampled_t[0, 0].cpu().numpy()
 
 
 def _bg_disp_row() -> np.ndarray:
@@ -149,8 +204,13 @@ def run_splat(name: str, with_circle: bool) -> str:
 
     base = make_visual_gradient()
     source = make_source(base, with_circle)
-    depthnorm = make_depthnorm(with_circle)
+    depthnorm_analytic = make_depthnorm(with_circle)
+    depthnorm = _apply_production_depth_pipeline(depthnorm_analytic)
     cv2.imwrite(os.path.join(variant_dir, "source.png"), source)
+    cv2.imwrite(
+        os.path.join(variant_dir, "depthnorm_pipeline.png"),
+        (np.clip(depthnorm, 0.0, 1.0) * 255).astype(np.uint8),
+    )
 
     video_path = os.path.join(variant_dir, "source.mkv")
     source_frames = np.stack([cv2.cvtColor(source, cv2.COLOR_BGR2RGB)] * NUM_FRAMES, axis=0)
