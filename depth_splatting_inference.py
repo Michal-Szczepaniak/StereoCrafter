@@ -50,7 +50,12 @@ def _format_duration(seconds: float) -> str:
 
 
 def _edge_threshold_fill(depth_t, threshold, n_iters):
-    """depth_t: [T,1,H,W] tensor, LOW-RES (pre-upsample) raw depth.
+    """depth_t: [T,1,H,W] tensor. Called on the FULL-RES, already-bilinear-
+    upsampled depth (see the call site in DepthCrafterDemo.infer()) - NOT
+    the low-res raw depth the name/older comments here once implied. Each
+    pass's 4-neighbor reach is therefore in FULL-RES pixels, not low-res
+    ones; n_iters may need to be larger than a low-res-grid tuning to close
+    the same real-world gap width.
 
     Root-cause fix for the silhouette comb/notch artifact (see the whole
     investigation this session): DepthCrafter (and every other monocular
@@ -63,8 +68,9 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     the comb: real silhouettes aren't straight lines, so a soft transition
     band's exact "effective edge" position drifts row to row.
 
-    This reverses that softness at the source, before any upsampling, via
-    a per-pass, per-pixel flood-fill re-evaluated fresh every pass against
+    This reverses that softness (now on the full-res, bilinear-upsampled
+    result - see the reordering note above) via a per-pass, per-pixel
+    flood-fill re-evaluated fresh every pass against
     each pixel's CURRENT (just-updated) value - not a one-time
     classification:
       - a pixel currently <= threshold takes the MIN of its 4 literal
@@ -84,16 +90,18 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         stuck the way MIN does on a mutually-reinforcing low pair.
 
     threshold is in the SAME units as depth_t (not normalized to [0,1]) -
-    callers pass e.g. chunk_min + frac*(chunk_max-chunk_min). n_iters
-    controls how many pixels wide a transition band this can fully close
-    (a band wider than ~n_iters low-res pixels may only partially close).
+    callers pass e.g. chunk_min + frac*(chunk_max-chunk_min), computed from
+    the LOW-RES depth's own range (bilinear upsampling can't produce values
+    outside that range, so it's identical to the full-res range). n_iters
+    controls how many pixels wide a transition band this can fully close -
+    now FULL-RES pixels, since this runs after upsampling, not low-res ones
+    as it used to when this ran before upsampling.
 
-    Validated end-to-end (real splat + real stage-2 inpainting, not just
-    visual inspection of the depth map) on real footage at threshold_frac
-    around 0.10-0.20 of the chunk's own range and n_iters=3, at
-    max_res=768 specifically - re-verify if used at a different max_res,
-    since the halo's absolute low-res-pixel width was measured to differ
-    between 384 and 768.
+    Older validation (n_iters=3, threshold_frac 0.10-0.20, max_res=768) was
+    measured on the OLD fill-then-upsample order, where n_iters counted
+    low-res pixels - not directly comparable now that iteration reach is in
+    full-res pixels; re-tune/re-verify n_iters under this order before
+    trusting the old default's value un-scaled.
     """
     current = depth_t
     for _ in range(n_iters):
@@ -385,10 +393,13 @@ class DepthCrafterDemo:
         edge_fill_iters: int = 3,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
-        applied to each chunk's raw low-res depth before upsampling (see
-        that function's own docstring for the full mechanism/rationale).
-        Validated end-to-end at frac=0.10, iters=3, max_res=768 on real
-        footage - re-verify at other max_res values.
+        applied to each chunk's depth AFTER it's bilinear-upsampled to full
+        resolution (see that function's own docstring for the full
+        mechanism/rationale, and why upsample-then-fill replaced the older
+        fill-then-upsample order). Old validation (frac=0.10, iters=3,
+        max_res=768) was measured under that older order and is not
+        directly comparable now that edge_fill_iters' reach is in full-res
+        pixels instead of low-res ones - re-verify before trusting as-is.
 
         window_size/window_overlap control DepthCrafter's OWN internal
         sliding-window inference within a single self.pipe() call - these
@@ -720,65 +731,62 @@ class DepthCrafterDemo:
                     "max=", np.nanmax(result),
                 )
 
-                # ROOT-CAUSE FIX for the silhouette comb/notch artifact (see
-                # _edge_threshold_fill's own docstring for the full
-                # mechanism). Earlier attempts in this same investigation
-                # (nearest vs bilinear upsampling, crack-closing, z-buffer
-                # splat, plain depth-map sharpening/dilation) were all
-                # symptom-side patches on top of an unmodified soft depth
-                # signal, and none of them fixed it - it's present
-                # identically in upstream's own unmodified
-                # camel_splatting_results.jpg demo asset. This instead
-                # reverses the depth model's own soft-edge output at the
-                # source, on the raw low-res chunk, before any upsampling -
-                # validated end-to-end (real splat + real stage-2
-                # inpainting) on real footage, not just visual inspection.
-                # edge_threshold only needs a global min/max, computed
-                # straight from the numpy array - no need to hold the whole
-                # chunk on GPU just for a scalar reduction (this itself was
-                # an unbatched full-chunk GPU allocation, found via the same
-                # audit that found the depth-quantization/splatting-pass
-                # instances below).
+                # UPSAMPLE-THEN-FILL, not fill-then-upsample: silhouette
+                # curvature (e.g. a character's round head) gets aliased
+                # into a low-res-grid staircase the moment depth is computed
+                # at max_res - a real, unavoidable undersampling artifact,
+                # not noise (confirmed directly: a synthetic circle with a
+                # perfectly clean, already-hard boundary run through this
+                # exact pipeline still produces the identical jagged
+                # crescent). Filling the LOW-RES grid (the old order) can
+                # only reclassify which coarse low-res pixel is foreground -
+                # it can never add curvature resolution the grid never had,
+                # so nearest-vs-bilinear upsampling afterward was always
+                # rendering the same staircase, just with a different pixel
+                # style (blocky vs blurred). Upsampling FIRST with bilinear
+                # instead linearly interpolates BETWEEN adjacent low-res
+                # samples (the same trick marching-squares uses to find a
+                # sub-pixel contour crossing from a coarse grid), giving a
+                # smoother, less-faceted estimate of the true boundary
+                # position than nearest's hard snap-to-low-res-pixel - not a
+                # full fix (curvature sharper than a straight line between
+                # two adjacent low-res samples still can't be recovered),
+                # but strictly better information than nearest ever had.
+                # _edge_threshold_fill then re-hardens that bilinear-softened
+                # edge on the FULL-RES grid instead of the low-res one - NOTE
+                # its 4-neighbor-per-pass reach is now in FULL-RES pixels,
+                # not low-res ones, so edge_fill_iters may need to be re-
+                # tuned (larger) to close the same real-world gap width the
+                # old low-res-grid version did at the validated iters=3.
+                #
+                # edge_threshold still only needs a global min/max, computed
+                # straight from the raw low-res numpy array before any GPU
+                # work - bilinear upsampling can't produce values outside
+                # the range of the samples it interpolates between, so the
+                # low-res range is exactly the full-res range too.
                 edge_threshold = float(result.min()) + edge_threshold_frac * (
                     float(result.max()) - float(result.min())
                 )
-                # Same OOM bug class found (and fixed) 3x already this
-                # session in the DepthCrafter submodule, this time in our
-                # own code: _edge_threshold_fill is a pure per-frame spatial
-                # op (up/down/left/right neighbor shifts within each frame,
-                # no cross-frame dependency at all) but was being run on the
-                # WHOLE chunk's tensor_res at once - fine at the old small
-                # CHUNK_SIZE, OOMs at a large one. Batch it by
-                # decode_chunk_size like everything else, bit-identical
-                # result since each frame is independent - and move each
-                # batch to GPU just-in-time here too, instead of the whole
-                # chunk upfront.
-                edge_filled_batches = []
+                # Bounded by decode_chunk_size (not the whole chunk at once)
+                # to avoid the OOM bug class found/fixed elsewhere in this
+                # file - upsample and edge-fill are both pure per-frame
+                # spatial ops with no cross-frame dependency, so batching is
+                # bit-identical to doing the whole chunk in one shot. Single
+                # combined loop (not two separate passes like the old fill-
+                # then-upsample order) since there's no longer a
+                # low-res-resolution intermediate tensor worth keeping
+                # around between the two steps.
+                result_batches = []
                 for i in range(0, result.shape[0], decode_chunk_size):
                     batch_gpu = torch.from_numpy(result[i : i + decode_chunk_size]).unsqueeze(1).float().cuda()
-                    edge_filled_batches.append(
-                        _edge_threshold_fill(batch_gpu, edge_threshold, edge_fill_iters)
-                    )
-                tensor_res = torch.cat(edge_filled_batches, dim=0)
-                # 5th instance of the same OOM bug class this session:
-                # F.interpolate is a pure per-frame spatial resize (nearest
-                # neighbor, no cross-frame dependency) but was upsampling
-                # the WHOLE chunk to full original resolution in one shot -
-                # at CHUNK_SIZE=1440 and 1080x1920 that's an ~11.1GiB tensor
-                # on its own, both on GPU (the interpolate call itself) and
-                # then again in system RAM (the .cpu().numpy() copy right
-                # after). Batch it, converting each batch to numpy
-                # immediately so the GPU-side tensor for that batch is
-                # freed before the next one starts, bounding both VRAM and
-                # system RAM by decode_chunk_size instead of CHUNK_SIZE.
-                result_batches = []
-                for i in range(0, tensor_res.shape[0], decode_chunk_size):
                     batch_upsampled = F.interpolate(
-                        tensor_res[i : i + decode_chunk_size],
+                        batch_gpu,
                         size=(original_height, original_width),
-                        mode="nearest",
+                        mode="bilinear",
+                        align_corners=False,
                     )
-                    batch_np = batch_upsampled[:, 0].cpu().numpy()
+                    batch_filled = _edge_threshold_fill(batch_upsampled, edge_threshold, edge_fill_iters)
+                    batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
                     # same audit - a full-chunk np.isfinite(result) boolean
                     # array is "only" ~3GiB at this CHUNK_SIZE, versus the

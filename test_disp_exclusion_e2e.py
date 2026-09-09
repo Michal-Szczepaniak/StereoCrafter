@@ -121,31 +121,36 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
     depth_splatting_inference.py BEFORE it ever reaches DepthSplatting's
     splat step: (1) the depth model only ever sees/produces depth at a
     downscaled low-res resolution (get_video_info's own math, see
-    _production_low_res), never at full source resolution; (2)
-    _edge_threshold_fill runs on that raw low-res depth; (3) the result is
-    upsampled back to full resolution via nearest-neighbor (never
-    bilinear/bicubic - confirmed in DepthCrafterDemo.infer()).
+    _production_low_res), never at full source resolution; (2) that raw
+    low-res depth is upsampled to full resolution via BILINEAR (switched
+    from nearest - see depth_splatting_inference.py's call site comment:
+    bilinear linearly interpolates between adjacent low-res samples,
+    recovering some sub-low-res-pixel boundary position instead of
+    snapping to a blocky low-res-pixel step); (3) _edge_threshold_fill then
+    re-hardens that bilinear-softened edge on the FULL-RES result, not the
+    low-res one anymore.
 
     This test hand-authors a depth map directly (no real DepthCrafter
-    inference), so without this step it was skipping the entire
-    resolution round-trip that real footage always goes through - the
-    synthetic circle's boundary was analytically smooth at full 1080p,
-    which no real depth map ever is. Downscaling with INTER_AREA (not
-    NEAREST/LINEAR) before the fill so the low-res circle boundary starts
-    genuinely soft/anti-aliased, same as a real depth model's own softness
-    at its native inference resolution, rather than already artificially
-    hard.
+    inference), so without the resolution round-trip here, the synthetic
+    circle's boundary was analytically smooth at full 1080p, which no real
+    depth map ever is. Downscaling with INTER_AREA (not NEAREST/LINEAR)
+    so the low-res circle boundary starts genuinely soft/anti-aliased,
+    same as a real depth model's own softness at its native inference
+    resolution, rather than already artificially hard.
     """
     low_h, low_w = _production_low_res(H, W, MAX_RES)
     low_res = cv2.resize(depthnorm_full, (low_w, low_h), interpolation=cv2.INTER_AREA)
 
+    # threshold from the low-res range - bilinear upsampling can't produce
+    # values outside the range of the samples it interpolates between, so
+    # the low-res range equals the full-res range too (matches production).
     threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
         float(low_res.max()) - float(low_res.min())
     )
     low_res_t = torch.from_numpy(low_res).unsqueeze(0).unsqueeze(0).float().cuda()
-    filled_t = _edge_threshold_fill(low_res_t, threshold, EDGE_FILL_ITERS)
-    upsampled_t = F.interpolate(filled_t, size=(H, W), mode="nearest")
-    return upsampled_t[0, 0].cpu().numpy()
+    upsampled_t = F.interpolate(low_res_t, size=(H, W), mode="bilinear", align_corners=False)
+    filled_t = _edge_threshold_fill(upsampled_t, threshold, EDGE_FILL_ITERS)
+    return filled_t[0, 0].cpu().numpy()
 
 
 def _bg_disp_row() -> np.ndarray:
