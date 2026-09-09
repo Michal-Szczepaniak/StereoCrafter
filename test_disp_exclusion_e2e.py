@@ -117,9 +117,15 @@ def make_depthnorm(with_circle: bool) -> np.ndarray:
     depth_splatting_inference.py's DepthSplatting: dequantized chunk value,
     then affine-mapped to disp via (depthnorm*2-1)*max_disp, using
     CHAR_MAX_DISP as `max_disp` for both variants so the SAME depthnorm
-    value always means the SAME real disp value in both runs)."""
+    value always means the SAME real disp value in both runs).
+
+    Deliberately runs in the OPPOSITE direction from the visual gradient
+    (which goes dark-to-light left-to-right) - depth goes light-to-dark
+    (far-to-near) left-to-right instead, so color and depth are never
+    just two copies of the same ramp. Makes it obvious in the output
+    which artifacts track color vs. which track depth."""
     xs = np.arange(W, dtype=np.float32)
-    bg_disp_row = BG_DISP_LO + (xs / (W - 1)) * (BG_DISP_HI - BG_DISP_LO)
+    bg_disp_row = BG_DISP_HI - (xs / (W - 1)) * (BG_DISP_HI - BG_DISP_LO)
     bg_depthnorm_row = bg_disp_row / (2.0 * CHAR_MAX_DISP) + 0.5
     depthnorm = np.tile(bg_depthnorm_row, (H, 1)).astype(np.float32)
 
@@ -193,6 +199,17 @@ def main():
     warp_ref, mask_ref, _disp_ref, _meta_ref = open_store(splat_without, mode="r")
     ref_hole_frac = (np.array(mask_ref[0:1])[0] > 127).mean()
     print(f"==> no-circle run hole fraction: {ref_hole_frac:.4%} (expect ~0)")
+
+    # Dump the RAW stage-1 splat output (before any inpainting at all) so
+    # the circle's shift and the real hole shape can be inspected directly,
+    # independent of stage 2 - a 20px shift on a 756px-diameter circle is
+    # only ~2.6% of its size, easy to miss by eye against the whole circle,
+    # but the mask makes the actual (thin crescent) hole shape unambiguous.
+    warp_with, mask_with, _disp_with, _meta_with = open_store(splat_with, mode="r")
+    splat_frame = cv2.cvtColor(np.array(warp_with[0:1])[0], cv2.COLOR_RGB2BGR)
+    cv2.imwrite(os.path.join(OUT_ROOT, "splat_with_circle.png"), splat_frame)
+    mask_frame = np.array(mask_with[0:1])[0]
+    cv2.imwrite(os.path.join(OUT_ROOT, "splat_mask.png"), mask_frame)
 
     # --- stage 2: real inpainting_inference.main(), classical_only=True
     # (fast - never loads the SVD pipeline, pre_trained_path/unet_path are
