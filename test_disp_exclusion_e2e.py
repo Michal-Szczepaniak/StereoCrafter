@@ -45,25 +45,26 @@ NUM_FRAMES = 4
 BG_DEPTHNORM = 0.5    # depthnorm=0.5 -> disp=(0.5*2-1)*max_disp=0 -> background never moves
 CIRCLE_DEPTHNORM = 1.0  # depthnorm=1.0 -> disp=+max_disp -> circle moves left by max_disp
 
-# Circle diameter = 70% of H (for spotting artifacts more easily) - the
-# shift distance scales WITH it, not independently: the whole "hole ==
-# exactly the pre-circle gradient" ground truth depends on the shifted
-# circle landing fully clear of the original footprint (no overlap, or the
-# hole degenerates into a partial crescent instead of a full clean disk).
-# SHIFT_PX must exceed the diameter; GAP just keeps a visibly empty band
-# between the two footprints so it's obvious in the dumped PNGs which is
-# which.
+# Circle diameter = 70% of H (for spotting artifacts more easily), centered
+# in frame - this is the ORIGINAL position, which is what matters: the hole
+# (and the ground-truth check below) is exactly this footprint. The shift
+# distance just needs to exceed the diameter so the shifted copy lands
+# fully clear of the original (no overlap, or the hole degenerates into a
+# partial crescent instead of a full clean disk) - it does NOT need to
+# stay fully on-canvas itself; the shifted circle is free to clip off the
+# left edge (harmless - we don't check anything there), which is what
+# happens here since a 70%-of-H circle plus its required shift is wider
+# than a single 1080p frame can fit twice. GAP just keeps a visibly empty
+# band between the two footprints so it's obvious in the dumped PNGs which
+# is which.
 CIRCLE_R = round(0.35 * H)
 GAP = max(10, CIRCLE_R // 2)
 SHIFT_PX = 2 * CIRCLE_R + GAP
 MAX_DISP = SHIFT_PX  # circle disp == max_disp -> exactly SHIFT_PX of movement
-MARGIN = 20
-CIRCLE_CENTER = (H // 2, W - CIRCLE_R - MARGIN)  # near the right edge, shifts left into frame
+CIRCLE_CENTER = (H // 2, W // 2)
 
-_min_w_needed = SHIFT_PX + 2 * CIRCLE_R + 2 * MARGIN
-assert W >= _min_w_needed, (
-    f"W={W} too small to fit the original+shifted circle footprints with margin "
-    f"(need >= {_min_w_needed}) - shrink CIRCLE_R's fraction of H or widen W"
+assert CIRCLE_CENTER[1] - CIRCLE_R >= 0 and CIRCLE_CENTER[1] + CIRCLE_R <= W, (
+    "circle doesn't fit centered in W - shrink CIRCLE_R's fraction of H or widen W"
 )
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
