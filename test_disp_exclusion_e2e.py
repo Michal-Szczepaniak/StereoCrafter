@@ -102,6 +102,16 @@ MAX_RES = 768
 EDGE_THRESHOLD_FRAC = 0.10
 EDGE_FILL_ITERS = 3
 
+# Guided-filter refinement (prototype, not yet in production). radius/eps
+# are the two standard guided-filter knobs: radius sets how far the local
+# linear regression window reaches (must be at least a few px wider than
+# the low-res-grid's upsample ratio to actually see structure on both
+# sides of a staircase step), eps controls how strongly it trusts guide
+# edges vs. falling back to a plain local average (small eps = snap hard
+# to guide edges, large eps = ~equivalent to a plain box blur of depth).
+GUIDED_FILTER_RADIUS = 8
+GUIDED_FILTER_EPS = 1e-3
+
 
 def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int]:
     """Mirrors get_video_info's own resize math exactly (round-to-64,
@@ -114,6 +124,47 @@ def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int
         low_h = round(height * scale / 64) * 64
         low_w = round(width * scale / 64) * 64
     return low_h, low_w
+
+
+def _guided_filter(guide_gray: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    """He/Sun/Tang 2010 guided image filter (single-channel guide), built
+    from plain cv2.boxFilter only - NOT cv2.ximgproc (that module needs
+    opencv-contrib-python; this repo's requirements.txt pins plain
+    opencv-python, so ximgproc.jointBilateralFilter/guidedFilter aren't
+    available without a dependency swap).
+
+    Refines `src` (here: depth, already bilinear-upsampled + edge-filled to
+    full res) so it locally tracks real structure in `guide_gray` (here:
+    the full-res RGB source frame, grayscale) instead of only reflecting
+    what a coarse low-res depth grid could represent. Mechanism: in each
+    local window, fits depth as an affine function of the guide's
+    intensity (depth = a*guide + b, solved by local least squares via box-
+    filtered first/second moments - a plain box filter computes an exact
+    per-pixel local mean in O(1) per pixel via an integral image, which is
+    what makes this cheap regardless of radius). Where the guide has a
+    strong edge (e.g. the real character silhouette), `a` swings sharply
+    to follow it; where the guide is flat, `a` collapses to ~0 and the
+    filter just locally averages src, same as a plain box blur.
+    """
+    guide = guide_gray.astype(np.float32)
+    p = src.astype(np.float32)
+    k = 2 * radius + 1
+
+    mean_I = cv2.boxFilter(guide, cv2.CV_32F, (k, k))
+    mean_p = cv2.boxFilter(p, cv2.CV_32F, (k, k))
+    corr_I = cv2.boxFilter(guide * guide, cv2.CV_32F, (k, k))
+    corr_Ip = cv2.boxFilter(guide * p, cv2.CV_32F, (k, k))
+
+    var_I = corr_I - mean_I * mean_I
+    cov_Ip = corr_Ip - mean_I * mean_p
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, (k, k))
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, (k, k))
+
+    return mean_a * guide + mean_b
 
 
 def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
@@ -151,6 +202,18 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
     upsampled_t = F.interpolate(low_res_t, size=(H, W), mode="bilinear", align_corners=False)
     filled_t = _edge_threshold_fill(upsampled_t, threshold, EDGE_FILL_ITERS)
     return filled_t[0, 0].cpu().numpy()
+
+
+def _apply_guided_refinement(depthnorm_full: np.ndarray, guide_bgr: np.ndarray) -> np.ndarray:
+    """Prototype-only extra step (not yet in production): guided-filter the
+    bilinear+edge-fill result from _apply_production_depth_pipeline against
+    the actual full-res RGB source frame, so the depth boundary snaps to
+    the REAL silhouette edge (visible in the RGB pixels at full 1080p, cost-
+    free) instead of only reflecting what the 768-wide depth grid could
+    represent. Does not touch DepthCrafter's own cost/resolution at all -
+    this runs after it, on its output."""
+    guide_gray = cv2.cvtColor(guide_bgr, cv2.COLOR_BGR2GRAY)
+    return _guided_filter(guide_gray, depthnorm_full, GUIDED_FILTER_RADIUS, GUIDED_FILTER_EPS)
 
 
 def _bg_disp_row() -> np.ndarray:
@@ -210,10 +273,15 @@ def run_splat(name: str, with_circle: bool) -> str:
     base = make_visual_gradient()
     source = make_source(base, with_circle)
     depthnorm_analytic = make_depthnorm(with_circle)
-    depthnorm = _apply_production_depth_pipeline(depthnorm_analytic)
+    depthnorm_pipeline = _apply_production_depth_pipeline(depthnorm_analytic)
+    depthnorm = _apply_guided_refinement(depthnorm_pipeline, source)
     cv2.imwrite(os.path.join(variant_dir, "source.png"), source)
     cv2.imwrite(
         os.path.join(variant_dir, "depthnorm_pipeline.png"),
+        (np.clip(depthnorm_pipeline, 0.0, 1.0) * 255).astype(np.uint8),
+    )
+    cv2.imwrite(
+        os.path.join(variant_dir, "depthnorm_guided.png"),
         (np.clip(depthnorm, 0.0, 1.0) * 255).astype(np.uint8),
     )
 
@@ -222,8 +290,15 @@ def run_splat(name: str, with_circle: bool) -> str:
     ffv1_encode(source_frames, video_path, "rgb24", W, H)
 
     depth_chunk_path = os.path.join(variant_dir, "depth_chunk_000.mkv")
+    # Clip before quantizing to uint16: the guided filter can overshoot
+    # slightly beyond [0,1] near strong edges (local linear-regression
+    # extrapolation, same ringing behavior as unsharp masking) - unlike
+    # plain interpolation, it isn't bounded by its input's own range.
+    # Without this a small negative value would silently wrap to a huge
+    # uint16 instead of erroring.
+    depthnorm_clipped = np.clip(depthnorm, 0.0, 1.0)
     quantized = np.stack(
-        [(depthnorm * DEPTH_QUANT_LEVELS).round().astype(np.uint16)] * NUM_FRAMES, axis=0
+        [(depthnorm_clipped * DEPTH_QUANT_LEVELS).round().astype(np.uint16)] * NUM_FRAMES, axis=0
     )
     ffv1_encode(quantized, depth_chunk_path, "gray16le", W, H)
     chunk_meta = [{"min": 0.0, "max": 1.0, "frames": NUM_FRAMES}]
