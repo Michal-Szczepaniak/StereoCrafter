@@ -9,9 +9,14 @@ Scenario: a left-to-right VISUAL gradient image with a solid circle
 gradient (not flat) - this is deliberate: a flat background disparity
 can't reproduce the "painting white over wood" bug, which came from a
 continuous depth gradient on the background itself (see conversation
-history). The circle's disparity is set far above the background's whole
-range, and large enough that it shifts by more than its own diameter, so
-its vacated footprint becomes one clean, non-overlapping circular hole.
+history). The circle's disparity is set to this project's own real
+max_disp default (20) - NOT scaled up to exceed the circle's own diameter
+- since no real footage can ever shift anything farther than max_disp
+regardless of how large/close the object is on screen. That means the
+hole is NOT a full clean disk (a 756px-diameter circle moving only 20px
+barely uncovers anything) - it's a thin ~20px crescent sliver along the
+circle's trailing edge, which is what a real disocclusion next to a large
+nearby object's silhouette actually looks like.
 
 Ground truth complication: since the background now has real (if gentle)
 disparity variation, it moves slightly under the warp too - so "the hole
@@ -46,30 +51,29 @@ H, W = 1080, 1920
 NUM_FRAMES = 4
 
 # Circle diameter = 70% of H (for spotting artifacts more easily), centered
-# in frame - this is the ORIGINAL position, which is what matters: the hole
-# is exactly this footprint regardless of what the background does (the
-# character's shift depends only on its OWN disparity). The shift distance
-# just needs to exceed the diameter so the shifted copy lands fully clear
-# of the original (no overlap, or the hole degenerates into a partial
-# crescent) - it does NOT need to stay fully on-canvas itself; the shifted
-# circle is free to clip off the left edge (harmless, unchecked). GAP keeps
-# a visibly empty band between the two footprints in the dumped PNGs.
+# in frame. CHAR_MAX_DISP is this project's own real max_disp default
+# (see run_stereo.sh's MAX_DISP) - the circle's disparity is set to exactly
+# this, so it shifts by SHIFT_PX=CHAR_MAX_DISP pixels, same as any real
+# object at maximum practical closeness would. Since that's far smaller
+# than the circle's own diameter, the shifted copy overlaps almost all of
+# the original - the hole is only the crescent-shaped sliver of the
+# original footprint the shifted copy doesn't cover.
 CIRCLE_R = round(0.35 * H)
-GAP = max(10, CIRCLE_R // 2)
-SHIFT_PX = 2 * CIRCLE_R + GAP
-CHAR_MAX_DISP = float(SHIFT_PX)  # circle disp == this -> exactly SHIFT_PX of movement
+CHAR_MAX_DISP = 20.0  # matches run_stereo.sh's MAX_DISP default
+SHIFT_PX = round(CHAR_MAX_DISP)
 CIRCLE_CENTER = (H // 2, W // 2)
+CIRCLE_CENTER_SHIFTED = (H // 2, W // 2 - SHIFT_PX)  # where the circle actually lands after the warp
 
 assert CIRCLE_CENTER[1] - CIRCLE_R >= 0 and CIRCLE_CENTER[1] + CIRCLE_R <= W, (
     "circle doesn't fit centered in W - shrink CIRCLE_R's fraction of H or widen W"
 )
 
-# Background disparity gradient range - realistic scale (matches this
-# project's own real max_disp default of 20), deliberately tiny relative to
-# CHAR_MAX_DISP so the character stays unambiguously "much closer than any
-# background" while the background still has genuine, non-flat depth
-# variation across the frame (the wood bug's actual precondition).
-BG_DISP_LO, BG_DISP_HI = -20.0, 20.0
+# Background disparity gradient range - a modest fraction of CHAR_MAX_DISP
+# (real wood-like depth variation, not spanning the whole disparity range)
+# so the circle stays unambiguously "much closer than any background"
+# while the background still has genuine, non-flat depth variation across
+# the frame (the wood bug's actual precondition).
+BG_DISP_LO, BG_DISP_HI = -5.0, 5.0
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
 
@@ -211,11 +215,16 @@ def main():
     ground_truth_bgr = cv2.cvtColor(ground_truth_bgr, cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(OUT_ROOT, "ground_truth.png"), ground_truth_bgr)
 
-    # Hole mask: the circle's ORIGINAL footprint - exact regardless of
-    # background motion, since the character's own shift only depends on
-    # its own disparity.
+    # Hole mask: the crescent sliver of the circle's ORIGINAL footprint that
+    # the SHIFTED copy doesn't cover - exact regardless of background
+    # motion, since the character's own shift only depends on its own
+    # disparity, not on the background at all.
     yy, xx = np.mgrid[0:H, 0:W]
-    hole_mask = (xx - CIRCLE_CENTER[1]) ** 2 + (yy - CIRCLE_CENTER[0]) ** 2 <= CIRCLE_R ** 2
+    orig_circle = (xx - CIRCLE_CENTER[1]) ** 2 + (yy - CIRCLE_CENTER[0]) ** 2 <= CIRCLE_R ** 2
+    shifted_circle = (
+        (xx - CIRCLE_CENTER_SHIFTED[1]) ** 2 + (yy - CIRCLE_CENTER_SHIFTED[0]) ** 2 <= CIRCLE_R ** 2
+    )
+    hole_mask = orig_circle & (~shifted_circle)
 
     true_vals = ground_truth_bgr[hole_mask].astype(np.float32)
     got_vals = result_bgr[hole_mask].astype(np.float32)
