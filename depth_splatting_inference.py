@@ -143,9 +143,22 @@ def _guided_filter_batch(guide_rgb: np.ndarray, src: np.ndarray, radius: int, ep
     collapses toward 0 and this just locally averages src like a plain box
     blur - see the false-color synthetic test in test_disp_exclusion_e2e.py
     that hit exactly this degenerate case (a weak ~20%-contrast edge
-    produced a wide blur/halo instead of a sharpened boundary). NOT yet
-    validated on real footage - gated off by default (guided_filter_radius
-    <= 0 in DepthSplatting) until it is.
+    produced a wide blur/halo instead of a sharpened boundary).
+
+    BAND-GATED (real-footage finding): a first real-footage test with no
+    gating showed the filter treats EVERY strong RGB edge as depth-
+    relevant, including pure linework/shading detail that carries zero
+    depth information - clothing folds, hair strands, collar seams -
+    since cel-shaded anime is full of clean, high-contrast ink lines with
+    no depth correlation at all (unlike photos, what guided filtering was
+    designed for). The resulting mask was "massacred" - noisy false edges
+    everywhere, not just at the real silhouette. Fix: only accept the
+    filtered value within `radius` pixels of a place where `src` ITSELF
+    (not the guide) already has a real depth transition (see
+    _depth_boundary_band) - flat-depth regions (the inside of a character/
+    object) are now immune no matter how much RGB texture sits on them,
+    since there's nothing for the filter to touch there regardless of
+    guide contrast.
 
     NOTE on eps scale: guide_rgb here is [0,1] float (decord's own frame
     scale), NOT the [0,255] scale test_disp_exclusion_e2e.py's prototype
@@ -176,8 +189,27 @@ def _guided_filter_batch(guide_rgb: np.ndarray, src: np.ndarray, radius: int, ep
         mean_a = cv2.boxFilter(a, cv2.CV_32F, (k, k))
         mean_b = cv2.boxFilter(b, cv2.CV_32F, (k, k))
 
-        out[idx] = mean_a * guide + mean_b
+        filtered = mean_a * guide + mean_b
+        band = _depth_boundary_band(p, radius)
+        out[idx] = np.where(band, filtered, p)
     return out
+
+
+def _depth_boundary_band(depth_2d: np.ndarray, band_radius: int, rel_thresh: float = 0.02) -> np.ndarray:
+    """Boolean mask, True within band_radius pixels of a place where
+    depth_2d itself (NOT the RGB guide) changes by more than rel_thresh of
+    its own [min,max] range between adjacent pixels - i.e. a REAL existing
+    depth transition. See _guided_filter_batch's docstring for why this
+    gating exists."""
+    dmin, dmax = float(depth_2d.min()), float(depth_2d.max())
+    span = max(dmax - dmin, 1e-6)
+    thresh = rel_thresh * span
+    dx = np.abs(np.diff(depth_2d, axis=1, append=depth_2d[:, -1:]))
+    dy = np.abs(np.diff(depth_2d, axis=0, append=depth_2d[-1:, :]))
+    edge = (dx > thresh) | (dy > thresh)
+    k = 2 * band_radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(edge.astype(np.uint8), kernel) > 0
 
 
 class LiveProgress:

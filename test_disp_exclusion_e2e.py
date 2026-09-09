@@ -126,6 +126,30 @@ def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int
     return low_h, low_w
 
 
+def _depth_boundary_band(depth_2d: np.ndarray, band_radius: int, rel_thresh: float = 0.02) -> np.ndarray:
+    """Boolean mask, True within band_radius pixels of a place where
+    depth_2d itself (NOT the RGB guide) changes by more than rel_thresh of
+    its own [min,max] range between adjacent pixels - i.e. a REAL existing
+    depth transition. Used to restrict guided-filter refinement to only
+    the vicinity of an already-known depth boundary, so it can never touch
+    flat-depth regions no matter how much RGB linework/texture sits on top
+    of them - real anime footage showed guided filtering with no such gate
+    treats every clothing-fold/hair-strand line as if it were a depth
+    edge, since it can't otherwise distinguish "real depth boundary" from
+    "strong-contrast ink line with zero depth information," which is
+    common in cel-shaded art but rare in photos (what guided filtering was
+    originally designed for)."""
+    dmin, dmax = float(depth_2d.min()), float(depth_2d.max())
+    span = max(dmax - dmin, 1e-6)
+    thresh = rel_thresh * span
+    dx = np.abs(np.diff(depth_2d, axis=1, append=depth_2d[:, -1:]))
+    dy = np.abs(np.diff(depth_2d, axis=0, append=depth_2d[-1:, :]))
+    edge = (dx > thresh) | (dy > thresh)
+    k = 2 * band_radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(edge.astype(np.uint8), kernel) > 0
+
+
 def _guided_filter(guide_gray: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
     """He/Sun/Tang 2010 guided image filter (single-channel guide), built
     from plain cv2.boxFilter only - NOT cv2.ximgproc (that module needs
@@ -164,7 +188,9 @@ def _guided_filter(guide_gray: np.ndarray, src: np.ndarray, radius: int, eps: fl
     mean_a = cv2.boxFilter(a, cv2.CV_32F, (k, k))
     mean_b = cv2.boxFilter(b, cv2.CV_32F, (k, k))
 
-    return mean_a * guide + mean_b
+    filtered = mean_a * guide + mean_b
+    band = _depth_boundary_band(p, radius)
+    return np.where(band, filtered, p)
 
 
 def _apply_production_depth_pipeline(depthnorm_full: np.ndarray) -> np.ndarray:
