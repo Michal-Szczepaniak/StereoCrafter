@@ -68,12 +68,15 @@ assert CIRCLE_CENTER[1] - CIRCLE_R >= 0 and CIRCLE_CENTER[1] + CIRCLE_R <= W, (
     "circle doesn't fit centered in W - shrink CIRCLE_R's fraction of H or widen W"
 )
 
-# Background disparity gradient range - a modest fraction of CHAR_MAX_DISP
-# (real wood-like depth variation, not spanning the whole disparity range)
-# so the circle stays unambiguously "much closer than any background"
-# while the background still has genuine, non-flat depth variation across
-# the frame (the wood bug's actual precondition).
-BG_DISP_LO, BG_DISP_HI = -5.0, 5.0
+# Background disparity gradient: full min-to-max range (depthnorm 0..1,
+# same as the depth chunk's own storage range) so it's clearly visible when
+# eyeballing depth_chunk_000.mkv directly, rather than a subtle few-percent
+# variation. This does mean the far-right edge of the background coincides
+# with the circle's own disp (both hit CHAR_MAX_DISP) - harmless for what
+# this test actually checks: disp_bg_search_px (default 25) is tiny next
+# to the frame's 1920px width, so that far-edge coincidence is nowhere
+# near the circle/hole and never enters its local exclusion search.
+BG_DISP_LO, BG_DISP_HI = -CHAR_MAX_DISP, CHAR_MAX_DISP
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
 
