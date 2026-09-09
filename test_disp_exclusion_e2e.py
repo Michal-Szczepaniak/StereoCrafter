@@ -41,6 +41,7 @@ import numpy as np
 from depth_splatting_inference import DepthSplatting
 from splat_store import ffv1_encode, open_store, DEPTH_QUANT_LEVELS
 import inpainting_inference
+from inpainting_inference import _disp_exclusion_mask
 
 # Real 1080p, matching the actual content this pipeline runs on - resolution
 # changes real behavior here (e.g. work_scale/64-padding, the comb/notch
@@ -92,14 +93,23 @@ BG_DISP_LO, BG_DISP_HI = -10.0, 10.0
 OUT_ROOT = "outputs/synthetic_disp_e2e"
 
 
-def make_visual_gradient() -> np.ndarray:
-    """(H,W,3) uint8 BGR - pure left-to-right 0-255 gradient, no circle.
-    Purely cosmetic/for-eyeballing - NOT tied to the depth gradient below
-    (real footage's color and depth aren't correlated either); ground
-    truth for the hole comes from the no-circle warp, not from this array
-    directly."""
+def _bg_disp_row() -> np.ndarray:
+    """(W,) float32 - the background's per-column real disparity value.
+    HIGH at x=0 (left), LOW at x=W-1 (right) - reversed from a plain
+    left-to-right ramp, per request. Single source of truth shared by both
+    the visual color gradient and the depth gradient below, so they always
+    correspond (high disp = bright, low disp = dark) instead of being two
+    independent ramps."""
     xs = np.arange(W, dtype=np.float32)
-    row = (xs / (W - 1) * 255).astype(np.uint8)
+    return BG_DISP_HI - (xs / (W - 1)) * (BG_DISP_HI - BG_DISP_LO)
+
+
+def make_visual_gradient() -> np.ndarray:
+    """(H,W,3) uint8 BGR - grayscale gradient derived directly from
+    _bg_disp_row(), so color always corresponds to depth (bright = high
+    disparity/near, dark = low disparity/far), not an independent ramp."""
+    bg_disp_row = _bg_disp_row()
+    row = ((bg_disp_row - BG_DISP_LO) / (BG_DISP_HI - BG_DISP_LO) * 255).astype(np.uint8)
     gradient = np.tile(row, (H, 1))
     return np.stack([gradient] * 3, axis=-1)
 
@@ -117,15 +127,10 @@ def make_depthnorm(with_circle: bool) -> np.ndarray:
     depth_splatting_inference.py's DepthSplatting: dequantized chunk value,
     then affine-mapped to disp via (depthnorm*2-1)*max_disp, using
     CHAR_MAX_DISP as `max_disp` for both variants so the SAME depthnorm
-    value always means the SAME real disp value in both runs).
-
-    Deliberately runs in the OPPOSITE direction from the visual gradient
-    (which goes dark-to-light left-to-right) - depth goes light-to-dark
-    (far-to-near) left-to-right instead, so color and depth are never
-    just two copies of the same ramp. Makes it obvious in the output
-    which artifacts track color vs. which track depth."""
-    xs = np.arange(W, dtype=np.float32)
-    bg_disp_row = BG_DISP_HI - (xs / (W - 1)) * (BG_DISP_HI - BG_DISP_LO)
+    value always means the SAME real disp value in both runs). Derived
+    from the SAME _bg_disp_row() the visual gradient uses, so they stay
+    correlated."""
+    bg_disp_row = _bg_disp_row()
     bg_depthnorm_row = bg_disp_row / (2.0 * CHAR_MAX_DISP) + 0.5
     depthnorm = np.tile(bg_depthnorm_row, (H, 1)).astype(np.float32)
 
@@ -211,11 +216,34 @@ def main():
     # independent of stage 2 - a 20px shift on a 756px-diameter circle is
     # only ~2.6% of its size, easy to miss by eye against the whole circle,
     # but the mask makes the actual (thin crescent) hole shape unambiguous.
-    warp_with, mask_with, _disp_with, _meta_with = open_store(splat_with, mode="r")
+    warp_with, mask_with, disp_with, meta_with = open_store(splat_with, mode="r")
     splat_frame = cv2.cvtColor(np.array(warp_with[0:1])[0], cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(OUT_ROOT, "splat_with_circle.png"), splat_frame)
     mask_frame = np.array(mask_with[0:1])[0]
     cv2.imwrite(os.path.join(OUT_ROOT, "splat_mask.png"), mask_frame)
+
+    # Dump the ACTUAL generation mask (hole | exclusion) using the real
+    # persisted disp data and inpainting_inference.main()'s own defaults
+    # (disp_exclude_margin=1.0, disp_bg_search_px=25) - this is exactly
+    # what _prefill_occlusion/the diffusion conditioning saw as "needs
+    # filling", so it directly shows whether the exclusion is eating into
+    # real background near the circle (pushing TELEA's usable source
+    # farther away than necessary) rather than just the circle itself.
+    disp_max_with = meta_with["params"]["max_disp"]
+    disp_u16_with = np.array(disp_with[0:1])[0]
+    disp_np_with = disp_u16_with.astype(np.float32) / DEPTH_QUANT_LEVELS * (2.0 * disp_max_with) - disp_max_with
+    hole_bool_with = mask_frame[None] > 127
+    exclude_bool = _disp_exclusion_mask(disp_np_with[None], hole_bool_with, 1.0, 25)[0]
+    gen_mask_vis = np.where(hole_bool_with[0] | exclude_bool, 255, 0).astype(np.uint8)
+    cv2.imwrite(os.path.join(OUT_ROOT, "gen_mask.png"), gen_mask_vis)
+
+    # white = real hole, gray = excluded-as-source but NOT a real hole (the
+    # circle itself, plus any real background caught by the search radius)
+    excl_only_vis = np.zeros_like(gen_mask_vis)
+    excl_only_vis[exclude_bool & ~hole_bool_with[0]] = 128
+    excl_only_vis[hole_bool_with[0]] = 255
+    cv2.imwrite(os.path.join(OUT_ROOT, "gen_mask_excl_highlighted.png"), excl_only_vis)
+    print(f"==> real hole px: {hole_bool_with.sum()}, exclusion-only px (beyond the real hole): {(exclude_bool & ~hole_bool_with[0]).sum()}")
 
     # --- stage 2: real inpainting_inference.main(), classical_only=True
     # (fast - never loads the SVD pipeline, pre_trained_path/unet_path are
