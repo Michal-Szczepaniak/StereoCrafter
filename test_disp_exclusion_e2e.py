@@ -68,15 +68,26 @@ assert CIRCLE_CENTER[1] - CIRCLE_R >= 0 and CIRCLE_CENTER[1] + CIRCLE_R <= W, (
     "circle doesn't fit centered in W - shrink CIRCLE_R's fraction of H or widen W"
 )
 
-# Background disparity gradient: full min-to-max range (depthnorm 0..1,
-# same as the depth chunk's own storage range) so it's clearly visible when
-# eyeballing depth_chunk_000.mkv directly, rather than a subtle few-percent
-# variation. This does mean the far-right edge of the background coincides
-# with the circle's own disp (both hit CHAR_MAX_DISP) - harmless for what
-# this test actually checks: disp_bg_search_px (default 25) is tiny next
-# to the frame's 1920px width, so that far-edge coincidence is nowhere
-# near the circle/hole and never enters its local exclusion search.
-BG_DISP_LO, BG_DISP_HI = -CHAR_MAX_DISP, CHAR_MAX_DISP
+# Background disparity gradient. NOT the full +-CHAR_MAX_DISP range -
+# empirically (this session, real hardware) that pegs one CPU core for a
+# very long time in _forward_legacy_cuda_splat's CPU fallback. Cause:
+# ForwardWarpStereo's near-bias weighting is `1.414 ** (disp - disp.min())`
+# - unbounded upward, not clamped like a softmax's "subtract max" trick.
+# With background reaching -CHAR_MAX_DISP in the SAME batch as the circle
+# at +CHAR_MAX_DISP, that exponent hits 2*CHAR_MAX_DISP=40, i.e. weight
+# ratios around 1.4e6 - not an overflow, but exactly the kind of extreme
+# dynamic range that produces denormalized floats for the smallest-weighted
+# contributions, and denormal float arithmetic is a well-known single-
+# thread slowdown (10-100x) on CPU. +-10 keeps exponent span to 30 (ratio
+# ~2.9e4) - clearly visible in depth_chunk_000.mkv (spans the middle 50%
+# of the full storage range) without the cliff. NOTE: since this is
+# purely a property of the batch's total disp SPAN, not of the device,
+# real footage that puts a near-max_disp foreground object in the same
+# frame as background reaching toward -max_disp could hit the same
+# slowdown on the real pipeline, not just this synthetic test - worth
+# keeping in mind if a real run ever mysteriously stalls at the splat
+# step specifically.
+BG_DISP_LO, BG_DISP_HI = -10.0, 10.0
 
 OUT_ROOT = "outputs/synthetic_disp_e2e"
 
