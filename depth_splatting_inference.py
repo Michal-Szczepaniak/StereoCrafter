@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from typing import Optional
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -124,6 +125,59 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         is_bg = current <= threshold
         current = torch.where(is_bg, neighbor_min_confirmed, neighbor_max)
     return current
+
+
+def _guided_filter_batch(guide_rgb: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    """guide_rgb: [N,H,W,3] float32 in [0,1] (RGB, matching decord's own
+    frame order - see the caller). src: [N,H,W] float32. Returns src
+    refined per-frame so it locally tracks real structure in guide_rgb.
+
+    He/Sun/Tang 2010 Guided Image Filter (grayscale guide), built from
+    plain cv2.boxFilter only - NOT cv2.ximgproc (needs opencv-contrib-
+    python; this repo pins plain opencv-python). In each local window,
+    fits depth as an affine function of the guide's luma (depth = a*guide
+    + b, via local least squares computed through box-filtered first/
+    second moments): where the guide has a strong edge (a real silhouette
+    against a differently-lit/colored background), `a` swings sharply to
+    follow it; where the guide is flat or the edge is low-contrast, `a`
+    collapses toward 0 and this just locally averages src like a plain box
+    blur - see the false-color synthetic test in test_disp_exclusion_e2e.py
+    that hit exactly this degenerate case (a weak ~20%-contrast edge
+    produced a wide blur/halo instead of a sharpened boundary). NOT yet
+    validated on real footage - gated off by default (guided_filter_radius
+    <= 0 in DepthSplatting) until it is.
+
+    NOTE on eps scale: guide_rgb here is [0,1] float (decord's own frame
+    scale), NOT the [0,255] scale test_disp_exclusion_e2e.py's prototype
+    used - the same eps value means a very different amount of
+    regularization in each (eps is compared directly against the guide's
+    own variance, which is ~255^2x larger in the [0,255] version). Re-tune
+    eps for this scale independently; don't carry over a value tuned in
+    the test script unscaled.
+    """
+    n = guide_rgb.shape[0]
+    k = 2 * radius + 1
+    out = np.empty_like(src)
+    for idx in range(n):
+        guide = cv2.cvtColor(guide_rgb[idx], cv2.COLOR_RGB2GRAY)
+        p = src[idx]
+
+        mean_I = cv2.boxFilter(guide, cv2.CV_32F, (k, k))
+        mean_p = cv2.boxFilter(p, cv2.CV_32F, (k, k))
+        corr_I = cv2.boxFilter(guide * guide, cv2.CV_32F, (k, k))
+        corr_Ip = cv2.boxFilter(guide * p, cv2.CV_32F, (k, k))
+
+        var_I = corr_I - mean_I * mean_I
+        cov_Ip = corr_Ip - mean_I * mean_p
+
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+
+        mean_a = cv2.boxFilter(a, cv2.CV_32F, (k, k))
+        mean_b = cv2.boxFilter(b, cv2.CV_32F, (k, k))
+
+        out[idx] = mean_a * guide + mean_b
+    return out
 
 
 class LiveProgress:
@@ -1177,6 +1231,8 @@ def DepthSplatting(
     device="cuda",
     keep_depth_chunks=False,
     max_frames=None,
+    guided_filter_radius=0,
+    guided_filter_eps=1e-3,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -1229,6 +1285,24 @@ def DepthSplatting(
     whenever stride > 1, i.e. whenever target_fps < source fps). This reads
     the same strided frame indices back out of the source video, so image
     and depth stay paired.
+
+    guided_filter_radius/guided_filter_eps: EXPERIMENTAL, off by default
+    (radius<=0 skips it entirely - bit-identical to before this was added).
+    When enabled, refines each batch's full-res depth against that same
+    batch's full-res RGB frame (already read here for warping - no extra
+    decode cost) via _guided_filter_batch, so the depth boundary can snap
+    to the real silhouette edge visible in the RGB pixels instead of only
+    reflecting what the low-res DepthCrafter grid captured. This is the
+    natural place to do it: DepthCrafterDemo.infer() never sees full-res
+    RGB at all (decord resizes to processing_height/width on decode there,
+    deliberately, to avoid a wasted full-res decode), so this is the first
+    point in the whole pipeline where full-res depth and full-res RGB are
+    both already in memory together. NOT validated on real footage yet -
+    a synthetic test (test_disp_exclusion_e2e.py) found it can badly
+    OVER-smooth (wide blur/halo, worse than doing nothing) when the guide's
+    local contrast at the true edge is weak/ambiguous - re-tune radius/eps
+    per-episode and inspect real output before trusting it, same as
+    edge_threshold_frac/edge_fill_iters above.
     """
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     native_num_frames = len(vid_reader)
@@ -1368,6 +1442,16 @@ def DepthSplatting(
             batch_depth = (batch_depth - global_min) / (global_max - global_min)
             batch_depth = np.clip(batch_depth, 0.0, 1.0)
 
+            if guided_filter_radius > 0:
+                batch_depth = _guided_filter_batch(
+                    batch_frames, batch_depth, guided_filter_radius, guided_filter_eps
+                )
+                # guided filter can overshoot slightly beyond [0,1] near
+                # strong edges (local linear-regression extrapolation,
+                # unlike plain interpolation which stays within its
+                # input's range) - reclip before it feeds disp_map below.
+                batch_depth = np.clip(batch_depth, 0.0, 1.0)
+
             left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().to(device)
             disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().to(device)
             disp_map = disp_map * 2.0 - 1.0
@@ -1491,6 +1575,8 @@ def main(
     edge_fill_iters: int = 3,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
+    guided_filter_radius: int = 0,
+    guided_filter_eps: float = 1e-3,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -1548,6 +1634,8 @@ def main(
         "decode_chunk_size": decode_chunk_size,
         "edge_threshold_frac": edge_threshold_frac,
         "edge_fill_iters": edge_fill_iters,
+        "guided_filter_radius": guided_filter_radius,
+        "guided_filter_eps": guided_filter_eps,
     }
     if resume and _store_is_complete(output_dir, store_params):
         print(f"==> Stage 1 already complete for these params - reusing existing store at {output_dir}")
@@ -1610,6 +1698,8 @@ def main(
             compress_store=compress_store,
             disp_tolerance=disp_tolerance,
             keep_depth_chunks=keep_depth_chunks,
+            guided_filter_radius=guided_filter_radius,
+            guided_filter_eps=guided_filter_eps,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")

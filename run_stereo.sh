@@ -110,6 +110,17 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 
+# EXPERIMENTAL, off by default (radius<=0 skips it entirely - see
+# _guided_filter_batch's docstring in depth_splatting_inference.py). When
+# enabled, refines depth against the actual full-res source RGB frame so
+# its boundary can snap to the real silhouette edge instead of only
+# reflecting the low-res DepthCrafter grid. NOT validated on real footage -
+# a synthetic test found it can badly OVER-smooth (wide blur/halo) when the
+# guide's local contrast at the true edge is weak. Re-tune per-episode and
+# inspect real output before trusting it.
+GUIDED_FILTER_RADIUS="${GUIDED_FILTER_RADIUS:-0}"
+GUIDED_FILTER_EPS="${GUIDED_FILTER_EPS:-1e-3}"
+
 # Keep the depth checkpoint around after a successful run instead of
 # deleting it (both the per-chunk files as splatting consumes them, and the
 # whole .depth_checkpoint dir at the end) - for when you actually need to
@@ -237,6 +248,8 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
+        --guided_filter_radius="$GUIDED_FILTER_RADIUS" \
+        --guided_filter_eps="$GUIDED_FILTER_EPS" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \
         2>&1 | tee "$STAGE1_LOG"
 }
