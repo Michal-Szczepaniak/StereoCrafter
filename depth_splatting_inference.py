@@ -127,6 +127,63 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     return current
 
 
+def _position_preserving_sharpen(depth_t, radius, gain):
+    """depth_t: [T,1,H,W] tensor, FULL-RES, already bilinear-upsampled.
+    Re-hardens the soft transition WITHOUT moving where it sits - the
+    alternative to _edge_threshold_fill.
+
+    Why this exists: a low-res depth pixel that straddles a real silhouette
+    holds a coverage-weighted blend of the foreground and background depth,
+    so its value encodes the SUB-PIXEL position of the boundary inside that
+    pixel - exactly how anti-aliasing works. _edge_threshold_fill throws
+    that away (see its own docstring). This keeps it: contrast-stretch
+    about the LOCAL midpoint between the two plateaus, so the 50% crossing
+    - the boundary itself - is a fixed point of the operation.
+
+      local_hi/local_lo = grayscale dilate/erode (max/min over a (2r+1)^2
+        window) = the FG and BG plateau values on either side
+      level = their midpoint = the value at 50% coverage
+      out = clamp((depth - level) * gain + level, local_lo, local_hi)
+
+    Properties, all verified offline (numpy/scipy, see verify_stretch.py /
+    sweep_stretch.py / verify_edgefill.py in the repo root):
+      - At the crossing depth == level, so it is left exactly in place:
+        boundary position stays sub-low-res-pixel accurate instead of
+        being quantized to the depth grid.
+      - Over a linear gradient a symmetric window's min and max average to
+        the center value, so depth - level == 0 and smooth background
+        depth ramps pass through untouched (no terracing).
+      - Flat regions have local_lo == local_hi == depth, so it self-
+        disables rather than amplifying noise.
+      - Clamping to [local_lo, local_hi] prevents the overshoot/ringing a
+        plain unsharp mask would produce.
+
+    Measured against _edge_threshold_fill on a gradient-background +
+    circle scene (boundary position error and mean outward shift, in
+    full-res px):
+
+        no sharpening (soft ramp)   RMS 1.30   shift +1.18
+        edge_fill iters=1           RMS 2.34   shift +2.25
+        edge_fill iters=3           RMS 4.43   shift +4.34
+        this, gain=3                RMS 0.96   shift +0.87
+
+    radius: needs to reach the flat plateau on both sides, i.e. >= the
+    ramp width (~1-2 low-res px x the upsample ratio). Insensitive past
+    that - 6, 8 and 12 measured identical - so it barely needs tuning;
+    stay near the minimum so it doesn't span separate thin structures
+    (hair strands). gain: 3 narrows the edge ~6.3px -> ~1.8px at zero
+    positional cost; higher buys a harder edge but adds row-to-row jitter
+    (gain=6 +35%, gain=12 +130%, gain=inf, the classic morphological
+    toggle-contrast operator, +265%).
+    """
+    k = 2 * radius + 1
+    local_hi = F.max_pool2d(depth_t, kernel_size=k, stride=1, padding=radius)
+    local_lo = -F.max_pool2d(-depth_t, kernel_size=k, stride=1, padding=radius)
+    level = 0.5 * (local_lo + local_hi)
+    stretched = (depth_t - level) * gain + level
+    return torch.minimum(torch.maximum(stretched, local_lo), local_hi)
+
+
 def _guided_filter_batch(guide_rgb: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
     """guide_rgb: [N,H,W,3] float32 in [0,1] (RGB, matching decord's own
     frame order - see the caller). src: [N,H,W] float32. Returns src
@@ -477,6 +534,9 @@ class DepthCrafterDemo:
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
         edge_fill_iters: int = 3,
+        sharpen_mode: str = "edge_fill",
+        sharpen_radius: int = 6,
+        sharpen_gain: float = 3.0,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's depth AFTER it's bilinear-upsampled to full
@@ -614,6 +674,24 @@ class DepthCrafterDemo:
             "seed": seed,
             "target_fps": target_fps,
             "decode_chunk_size": decode_chunk_size,
+            # BUGFIX: the depth-sharpening params belong in the resume key
+            # too. The chunk files this checkpoint indexes are written
+            # AFTER sharpening (see the write path below - upsample and
+            # sharpen both happen before quantization), so they have the
+            # sharpening baked in. Leaving these out meant a checkpoint
+            # stayed "matching" across a change to them, and a resumed run
+            # silently kept chunks built with the OLD setting while
+            # reporting the new one. Only bit an interrupted or
+            # depth_only/keep_depth_chunks run (a completed run deletes its
+            # checkpoint, and _store_is_complete does check these), but
+            # that is exactly the sweep-the-parameter workflow these are
+            # for. Adding them invalidates existing checkpoints, which is
+            # the correct behavior - those really are stale.
+            "edge_threshold_frac": edge_threshold_frac,
+            "edge_fill_iters": edge_fill_iters,
+            "sharpen_mode": sharpen_mode,
+            "sharpen_radius": sharpen_radius,
+            "sharpen_gain": sharpen_gain,
         }
 
         output_start = 0
@@ -845,14 +923,39 @@ class DepthCrafterDemo:
                 # tuned (larger) to close the same real-world gap width the
                 # old low-res-grid version did at the validated iters=3.
                 #
-                # edge_threshold still only needs a global min/max, computed
+                # WHICH re-hardening operator runs is sharpen_mode:
+                #   "edge_fill"  - _edge_threshold_fill, the long-standing
+                #     behavior. Measured (see _position_preserving_sharpen's
+                #     docstring) to act as a ~1px-per-iteration DILATION of
+                #     the foreground rather than a sharpener, because its
+                #     threshold is global: when both sides of a boundary sit
+                #     above it (85% of the frame did, on the test scene),
+                #     both take the max-of-neighbors branch and the brighter
+                #     side simply grows. That is the "aura/halo around
+                #     characters" this pipeline has always had.
+                #   "stretch" - _position_preserving_sharpen, which hardens
+                #     about the LOCAL plateau midpoint instead, leaving the
+                #     boundary's sub-pixel position untouched.
+                #
+                # edge_threshold only needs a global min/max, computed
                 # straight from the raw low-res numpy array before any GPU
                 # work - bilinear upsampling can't produce values outside
                 # the range of the samples it interpolates between, so the
-                # low-res range is exactly the full-res range too.
+                # low-res range is exactly the full-res range too. (Unused
+                # by "stretch", which derives its level locally per pixel -
+                # that locality is the entire point.)
                 edge_threshold = float(result.min()) + edge_threshold_frac * (
                     float(result.max()) - float(result.min())
                 )
+                if sharpen_mode not in ("edge_fill", "stretch"):
+                    raise ValueError(
+                        f"sharpen_mode must be 'edge_fill' or 'stretch', got {sharpen_mode!r}"
+                    )
+                print(f"    depth sharpen: mode={sharpen_mode}", end="")
+                if sharpen_mode == "stretch":
+                    print(f", radius={sharpen_radius}, gain={sharpen_gain}")
+                else:
+                    print(f", threshold_frac={edge_threshold_frac}, iters={edge_fill_iters}")
                 # Bounded by decode_chunk_size (not the whole chunk at once)
                 # to avoid the OOM bug class found/fixed elsewhere in this
                 # file - upsample and edge-fill are both pure per-frame
@@ -871,7 +974,14 @@ class DepthCrafterDemo:
                         mode="bilinear",
                         align_corners=False,
                     )
-                    batch_filled = _edge_threshold_fill(batch_upsampled, edge_threshold, edge_fill_iters)
+                    if sharpen_mode == "stretch":
+                        batch_filled = _position_preserving_sharpen(
+                            batch_upsampled, sharpen_radius, sharpen_gain
+                        )
+                    else:
+                        batch_filled = _edge_threshold_fill(
+                            batch_upsampled, edge_threshold, edge_fill_iters
+                        )
                     batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
                     # same audit - a full-chunk np.isfinite(result) boolean
@@ -1605,6 +1715,9 @@ def main(
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 3,
+    sharpen_mode: str = "edge_fill",
+    sharpen_radius: int = 6,
+    sharpen_gain: float = 3.0,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1623,11 +1736,22 @@ def main(
     transitions. window_overlap MUST be less than window_size - that's the
     model's own internal windowing constraint.
 
-    edge_threshold_frac/edge_fill_iters: tune the silhouette comb/notch
-    fix (see _edge_threshold_fill's docstring). These are very likely
-    content-dependent - different anime episodes have different amounts
-    of contrast/detail at silhouette edges - re-tune per-episode rather
-    than assuming the validated defaults (0.10, 3) transfer directly.
+    sharpen_mode: which operator re-hardens the depth edge after the
+    bilinear upsample to full res.
+      "edge_fill" (default, long-standing behavior): _edge_threshold_fill,
+        tuned by edge_threshold_frac/edge_fill_iters. Measured to behave
+        as a ~1px-per-iteration DILATION of the foreground rather than a
+        sharpener, because its threshold is global - that is the source of
+        the "aura/halo around characters" this pipeline has always had.
+        Content-dependent; re-tune per episode rather than assuming the
+        old defaults (0.10, 3) transfer.
+      "stretch": _position_preserving_sharpen, tuned by sharpen_radius/
+        sharpen_gain. Hardens about the LOCAL plateau midpoint, leaving
+        the boundary's sub-pixel position where it was. Measured 2.4-4.6x
+        lower boundary-position error and a smaller halo than edge_fill,
+        and its knobs barely need tuning (radius is insensitive above the
+        ramp width; gain=3 sharpens at zero positional cost). See
+        _position_preserving_sharpen's docstring for the numbers.
 
     resume: continue a previous run's depth pass from its checkpoint under
     {output_dir}/.depth_checkpoint if the parameters match (see
@@ -1666,6 +1790,9 @@ def main(
         "decode_chunk_size": decode_chunk_size,
         "edge_threshold_frac": edge_threshold_frac,
         "edge_fill_iters": edge_fill_iters,
+        "sharpen_mode": sharpen_mode,
+        "sharpen_radius": sharpen_radius,
+        "sharpen_gain": sharpen_gain,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1706,6 +1833,9 @@ def main(
         decode_chunk_size=decode_chunk_size,
         edge_threshold_frac=edge_threshold_frac,
         edge_fill_iters=edge_fill_iters,
+        sharpen_mode=sharpen_mode,
+        sharpen_radius=sharpen_radius,
+        sharpen_gain=sharpen_gain,
     )
 
     if depth_only:

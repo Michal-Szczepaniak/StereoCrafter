@@ -206,7 +206,11 @@ def _position_preserving_sharpen(depth: np.ndarray, radius: int, gain: float) ->
     the mask hug characters at all.
     """
     k = 2 * radius + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    # MORPH_RECT, not ELLIPSE: a square window is what the offline
+    # verification measured, and what production's torch implementation
+    # (F.max_pool2d) gives - keep all three identical so the numbers above
+    # actually describe what runs.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     local_lo = cv2.erode(depth, kernel)
     local_hi = cv2.dilate(depth, kernel)
     level = 0.5 * (local_lo + local_hi)

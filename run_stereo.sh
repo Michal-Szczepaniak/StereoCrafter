@@ -110,6 +110,21 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 
+# Which operator re-hardens the depth edge after upsampling to full res.
+# "edge_fill" (default) = the long-standing _edge_threshold_fill, tuned by
+# EDGE_THRESHOLD_FRAC/EDGE_FILL_ITERS above. "stretch" =
+# _position_preserving_sharpen, which hardens about the LOCAL plateau
+# midpoint so the boundary's sub-pixel position is left where it is -
+# measured 2.4-4.6x lower boundary-position error and a smaller halo,
+# with knobs that barely need tuning (see the function's docstring in
+# depth_splatting_inference.py). SHARPEN_RADIUS/SHARPEN_GAIN only apply
+# to "stretch"; radius just needs to be >= the ramp width (insensitive
+# past that), gain=3 sharpens at zero positional cost while higher values
+# harden more but add row-to-row jitter.
+SHARPEN_MODE="${SHARPEN_MODE:-edge_fill}"
+SHARPEN_RADIUS="${SHARPEN_RADIUS:-6}"
+SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
+
 # EXPERIMENTAL, off by default (radius<=0 skips it entirely - see
 # _guided_filter_batch's docstring in depth_splatting_inference.py). When
 # enabled, refines depth against the actual full-res source RGB frame so
@@ -248,6 +263,9 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
+        --sharpen_mode="$SHARPEN_MODE" \
+        --sharpen_radius="$SHARPEN_RADIUS" \
+        --sharpen_gain="$SHARPEN_GAIN" \
         --guided_filter_radius="$GUIDED_FILTER_RADIUS" \
         --guided_filter_eps="$GUIDED_FILTER_EPS" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \
