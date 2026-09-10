@@ -390,6 +390,56 @@ def spatial_tiled_process(
     return x
 
 
+def _rescue_failed_fills(
+    generated: torch.Tensor,
+    mask: torch.Tensor,
+    fallback: torch.Tensor,
+    rel_threshold: float,
+    feather: float = 2.0,
+) -> torch.Tensor:
+    """Replace hole pixels where the diffusion model visibly failed with the
+    classical fallback fill, feathered so the swap doesn't create its own seam.
+
+    The model's failure mode is localised, not global: run without the TELEA
+    prefill it produces genuinely correct texture (measured hole-vs-surrounding
+    detail ratio 0.84, against 1.00 for the real image) but craters to near-black
+    on a few percent of hole pixels. Run WITH the prefill it never craters but
+    just reproduces the prefill (ratio 0.36, barely above TELEA's own 0.27) -
+    see the CFG/denoise_strength sweeps. Neither setting wins, because the choice
+    is being made per-RUN when the failure is per-PIXEL.
+
+    So: let it run hot (prefill off), then rescue only what actually failed.
+    Measured on real footage at rel_threshold=0.25: detail ratio 0.75 with
+    near-black down from 4.12% to 0.08% - roughly twice the detail of any
+    setting that was clean on its own.
+
+    The test is RELATIVE, not an absolute black threshold: a hole pixel fails if
+    its luma is below rel_threshold x the median luma of a ring sampled just
+    outside that hole in the warp. An absolute cutoff would wrongly "rescue" a
+    night scene or a genuinely dark background, where near-black is the correct
+    answer.
+    """
+    out = generated.clone()
+    hole = (mask[:, 0] > 0.5).cpu().numpy()
+    ring_k = np.ones((15, 15), np.uint8)
+    for t in range(out.shape[0]):
+        if not hole[t].any():
+            continue
+        ring = (cv2.dilate(hole[t].astype(np.uint8), ring_k) > 0) & ~hole[t]
+        if not ring.any():
+            continue
+        luma = generated[t].mean(0).cpu().numpy()
+        ref = float(np.median(fallback[t].mean(0).cpu().numpy()[ring]))
+        failed = (hole[t] & (luma < rel_threshold * ref)).astype(np.uint8)
+        if not failed.any():
+            continue
+        failed = cv2.dilate(failed, np.ones((5, 5), np.uint8))
+        alpha = cv2.GaussianBlur(failed.astype(np.float32), (0, 0), feather)
+        a = torch.from_numpy(alpha).to(out.dtype).unsqueeze(0)
+        out[t] = a * fallback[t] + (1 - a) * out[t]
+    return out
+
+
 def _to_uint8_rgb(frame_float_chw: torch.Tensor) -> np.ndarray:
     """[t, c, h, w] float32 in [0,1] -> [t, h, w, c] uint8, no extra copies held."""
     arr = (frame_float_chw.clamp(0, 1) * 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
@@ -540,6 +590,7 @@ def main(
     dump_frames=None,
     seed=None,
     hole_threshold=127,
+    rescue_threshold=None,
     encode_preset=ENCODE_PRESET,
     encode_crf=ENCODE_CRF,
 ):
@@ -659,6 +710,22 @@ def main(
     catches nothing - confirmed empirically on this project's torch 2.13
     ROCm build (no triton installed): the call succeeds, then the first
     real forward pass crashes with torch._inductor.exc.TritonMissing.
+
+    rescue_threshold: post-composite per-pixel rescue of the diffusion
+    model's localised failures (see _rescue_failed_fills). A hole pixel whose
+    luma falls below this fraction of the median luma of a ring just outside
+    that hole is replaced by the classical TELEA fill, feathered. None
+    (default) disables it. 0.25 is the measured best point - swept on real
+    footage against the ab_cfg dump: 0.25 -> detail 0.75 / black 0.08%,
+    0.35 -> 0.69 / 0.07%, 0.50 -> 0.60 / 0.06%. Past 0.25 it keeps buying
+    nothing and costs real texture, since it starts rescuing pixels that
+    were legitimately dark rather than failed. Only useful
+    with prefill_occlusion=False - that is the configuration where the model
+    generates real texture (detail ratio 0.84 vs 1.00 for the real image)
+    at the cost of cratering to black on a few percent of hole pixels;
+    rescuing those brought black from 4.12% to 0.08% while keeping a 0.75
+    detail ratio, against 0.36 for the prefill-on configuration that was the
+    best previously available clean result.
 
     bench_iters/bench_start/dump_frames: benchmarking harness for A/B'ing
     every option above against a real splat store without touching the real
@@ -825,6 +892,7 @@ def main(
         "mask_skip_threshold": mask_skip_threshold,
         "classical_only": classical_only,
         "prefill_occlusion": prefill_occlusion,
+        "rescue_threshold": rescue_threshold,
         "vae_encode_chunk_size": vae_encode_chunk_size,
         "num_frames": num_frames,
         "width": width,
@@ -1193,6 +1261,21 @@ def main(
                 # but removes any soft edge from surviving into the blend.
                 mask_gate = ((mask_out - 0.5) / 0.5).clamp(0, 1)
                 generated_out = mask_gate * generated_out + (1 - mask_gate) * warp_out
+
+                # Per-pixel rescue of the model's localised failures - see
+                # _rescue_failed_fills. Only meaningful with prefill_occlusion
+                # off (with it on there is nothing to rescue, the model just
+                # echoes the prefill everywhere), so the fallback fill is
+                # computed here on demand rather than reusing model_warp.
+                if rescue_threshold is not None:
+                    fb_np = _prefill_occlusion(
+                        _to_uint8_rgb(warp_out),
+                        (mask_out[:, 0] > 0.5).cpu().numpy().astype(np.uint8) * 255,
+                    )
+                    fallback = torch.from_numpy(fb_np).permute(0, 3, 1, 2).float() / 255.0
+                    generated_out = _rescue_failed_fills(
+                        generated_out, mask_out, fallback, rescue_threshold
+                    )
 
             # OPTIMIZATION: write this chunk to disk now instead of appending to
             # a list that holds the entire output video in RAM until the end.
