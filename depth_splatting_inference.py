@@ -53,8 +53,19 @@ def _format_duration(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
-def _edge_threshold_fill(depth_t, threshold, n_iters):
-    """depth_t: [T,1,H,W] tensor, LOW-RES (pre-upsample) raw depth.
+def _edge_threshold_fill(depth_t, threshold, n_iters, offsets):
+    """depth_t: [T,1,H,W] tensor. Called on the FULL-RES, already-upsampled
+    depth (see the call site in DepthCrafterDemo.infer()), so each pass's
+    reach is one FULL-RES pixel. `offsets` picks the direction - see
+    EXPAND_RIGHT / EXPAND_OTHER below.
+
+    This is an EXPANSION pass, not a sharpener: it grows the foreground
+    classification so it still covers the real silhouette, which the
+    low-res depth grid cannot resolve exactly. Measured, its gap structure
+    is identical to doing nothing at every iteration count - max/min-of-
+    neighbours propagation TRANSLATES a ramp rather than narrowing it, so
+    it has no effect on splat tearing. See _position_preserving_sharpen
+    for that.
 
     Root-cause fix for the silhouette comb/notch artifact (see the whole
     investigation this session): DepthCrafter (and every other monocular
@@ -67,12 +78,14 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     the comb: real silhouettes aren't straight lines, so a soft transition
     band's exact "effective edge" position drifts row to row.
 
-    This reverses that softness at the source, before any upsampling, via
-    a per-pass, per-pixel flood-fill re-evaluated fresh every pass against
+    This reverses that softness (now on the full-res, bilinear-upsampled
+    result - see the reordering note above) via a per-pass, per-pixel
+    flood-fill re-evaluated fresh every pass against
     each pixel's CURRENT (just-updated) value - not a one-time
     classification:
-      - a pixel currently <= threshold takes the MIN of its 4 literal
-        attached neighbors (up/down/left/right) - but only neighbors that
+      - a pixel currently <= threshold takes the MIN of its attached
+        neighbors (see the directional neighbourhood in the loop below,
+        which is deliberately one-sided) - but only neighbors that
         are THEMSELVES currently above threshold count as candidates.
         Excluding same-side neighbors is required: without it, two
         adjacent below-threshold pixels just keep copying each other's low
@@ -82,31 +95,45 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         not a hypothetical. If a pixel has no above-threshold neighbor at
         all (real background, not near any edge), it just keeps its
         current value that pass.
-      - a pixel currently > threshold takes the MAX of all 4 neighbors,
+      - a pixel currently > threshold takes the MAX of all its neighbors,
         unconditionally - no exclusion needed on this side, since a plain
         MAX can only ever grow the high region pass over pass, never get
         stuck the way MIN does on a mutually-reinforcing low pair.
 
     threshold is in the SAME units as depth_t (not normalized to [0,1]) -
-    callers pass e.g. chunk_min + frac*(chunk_max-chunk_min). n_iters
-    controls how many pixels wide a transition band this can fully close
-    (a band wider than ~n_iters low-res pixels may only partially close).
+    callers pass e.g. chunk_min + frac*(chunk_max-chunk_min), computed from
+    the LOW-RES depth's own range (bilinear upsampling can't produce values
+    outside that range, so it's identical to the full-res range). n_iters
+    controls how many pixels wide a transition band this can fully close -
+    now FULL-RES pixels, since this runs after upsampling, not low-res ones
+    as it used to when this ran before upsampling.
 
-    Validated end-to-end (real splat + real stage-2 inpainting, not just
-    visual inspection of the depth map) on real footage at threshold_frac
-    around 0.10-0.20 of the chunk's own range and n_iters=3, at
-    max_res=768 specifically - re-verify if used at a different max_res,
-    since the halo's absolute low-res-pixel width was measured to differ
-    between 384 and 768.
+    Older validation (n_iters=3, threshold_frac 0.10-0.20, max_res=768) was
+    measured on the OLD fill-then-upsample order, where n_iters counted
+    low-res pixels - not directly comparable now that iteration reach is in
+    full-res pixels; re-tune/re-verify n_iters under this order before
+    trusting the old default's value un-scaled.
     """
+    def shift(t, dy, dx):
+        """t[y+dy, x+dx], replicate-padded at the borders."""
+        pad = (max(-dx, 0), max(dx, 0), max(-dy, 0), max(dy, 0))  # l, r, t, b
+        p = F.pad(t, pad, mode="replicate")
+        h, w = t.shape[-2], t.shape[-1]
+        y0, x0 = max(dy, 0), max(dx, 0)
+        return p[:, :, y0:y0 + h, x0:x0 + w]
+
+    # `offsets` selects WHICH way the foreground grows. It is directional
+    # by design - see EXPAND_RIGHT / EXPAND_OTHER below the function.
+    #
+    # (0, 0) must be in the set. Taking the max over NEIGHBOURS ONLY
+    # translates a region rather than growing it (verified: a one-sided
+    # neighbour set slides the block sideways, eroding the trailing edge),
+    # the same self-exclusion quirk that makes this operator slide a ramp
+    # sideways instead of narrowing it. Including the pixel itself makes
+    # it a genuine dilation.
     current = depth_t
     for _ in range(n_iters):
-        up = F.pad(current, (0, 0, 1, 0), mode="replicate")[:, :, :-1, :]
-        down = F.pad(current, (0, 0, 0, 1), mode="replicate")[:, :, 1:, :]
-        left = F.pad(current, (1, 0, 0, 0), mode="replicate")[:, :, :, :-1]
-        right = F.pad(current, (0, 1, 0, 0), mode="replicate")[:, :, :, 1:]
-
-        neighbors = torch.stack([up, down, left, right], dim=0)
+        neighbors = torch.stack([shift(current, dy, dx) for dy, dx in offsets], dim=0)
         neighbor_is_bg = neighbors <= threshold
 
         pos_inf = torch.finfo(neighbors.dtype).max
@@ -120,6 +147,131 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         is_bg = current <= threshold
         current = torch.where(is_bg, neighbor_min_confirmed, neighbor_max)
     return current
+
+
+# Grow the foreground RIGHTWARD (a background pixel takes the value of the
+# neighbour to its LEFT). The warp is `flow = -disp` (see
+# _forward_legacy_cuda_splat), so higher disparity shifts LEFT and the
+# disocclusion only ever opens on an object's RIGHT. That is where the
+# depth region being slightly too small leaves misclassified character
+# pixels exposed on what should now be background, so that is where growth
+# actually buys something.
+EXPAND_RIGHT = [(0, 0), (0, -1)]
+
+# Grow LEFT/UP/DOWN. Distinct knob because these are a TRADE, not a fix:
+#   - left: the body's own displacement usually moves over that area
+#     anyway, so the error self-heals; growing just smears the character
+#     further over background, and with no hole there to repaint it, that
+#     smear IS the "aura".
+#   - up/down: the warp never moves anything vertically, so a
+#     misclassified character pixel above/below the silhouette is never
+#     covered by the body and stays as an un-shifted fringe. Growing does
+#     make it shift with the character - but it then lands ~max_disp to
+#     the LEFT, as a smear. It relocates the artifact rather than
+#     removing it, so tune by eye rather than assuming more is better.
+EXPAND_OTHER = [(0, 0), (0, 1), (1, 0), (-1, 0)]
+
+
+def _position_preserving_sharpen(depth_t, radius, gain, min_contrast=0.0):
+    """depth_t: [T,1,H,W] tensor, FULL-RES, already bilinear-upsampled.
+    Re-hardens the soft transition WITHOUT moving where it sits - the
+    alternative to _edge_threshold_fill.
+
+    Why this exists: a low-res depth pixel that straddles a real silhouette
+    holds a coverage-weighted blend of the foreground and background depth,
+    so its value encodes the SUB-PIXEL position of the boundary inside that
+    pixel - exactly how anti-aliasing works. _edge_threshold_fill throws
+    that away (see its own docstring). This keeps it: contrast-stretch
+    about the LOCAL midpoint between the two plateaus, so the 50% crossing
+    - the boundary itself - is a fixed point of the operation.
+
+      local_hi/local_lo = grayscale dilate/erode (max/min over a (2r+1)^2
+        window) = the FG and BG plateau values on either side
+      level = their midpoint = the value at 50% coverage
+      out = clamp((depth - level) * gain + level, local_lo, local_hi)
+
+    Properties, all verified offline (numpy/scipy, see verify_stretch.py /
+    sweep_stretch.py / verify_edgefill.py in the repo root):
+      - At the crossing depth == level, so it is left exactly in place:
+        boundary position stays sub-low-res-pixel accurate instead of
+        being quantized to the depth grid.
+      - Over a linear gradient a symmetric window's min and max average to
+        the center value, so depth - level == 0 and smooth background
+        depth ramps pass through untouched (no terracing).
+      - Flat regions have local_lo == local_hi == depth, so it self-
+        disables rather than amplifying noise.
+      - Clamping to [local_lo, local_hi] prevents the overshoot/ringing a
+        plain unsharp mask would produce.
+
+    Measured against _edge_threshold_fill on a gradient-background +
+    circle scene (boundary position error and mean outward shift, in
+    full-res px):
+
+        no sharpening (soft ramp)   RMS 1.30   shift +1.18
+        edge_fill iters=1           RMS 2.34   shift +2.25
+        edge_fill iters=3           RMS 4.43   shift +4.34
+        this, gain=3                RMS 0.96   shift +0.87
+
+    radius: needs to reach the flat plateau on both sides, i.e. >= the
+    ramp width (~1-2 low-res px x the upsample ratio). Insensitive past
+    that - 6, 8 and 12 measured identical - so it barely needs tuning;
+    stay near the minimum so it doesn't span separate thin structures
+    (hair strands). gain: 3 narrows the edge ~6.3px -> ~1.8px at zero
+    positional cost; higher buys a harder edge but adds row-to-row jitter
+    (gain=6 +35%, gain=12 +130%, gain=inf, the classic morphological
+    toggle-contrast operator, +265%). Very high gain is what actually
+    suppresses splat tearing (it drives the count of intermediate
+    disparity levels to zero, and tearing is one gap per level), but only
+    together with min_contrast - see below.
+
+    min_contrast: absolute (same units as depth_t) local-contrast
+    threshold below which this leaves the input alone entirely. 0 disables
+    the gate. Callers normally pass a fraction of the chunk's own depth
+    range. Without it, high gain hard-steps EVERY mild depth transition in
+    the frame, each of which then produces its own small hole where the
+    warp previously covered it fine. Measured, gate as a fraction of the
+    full depth range:
+
+        jump/spread   gradient   raw   ungained   gate=0.15
+        3px / 10px      0.30      0        2          0
+        8px / 20px      0.40      0        4          0
+        12px / 10px     1.20      4       12         12
+        20px / 6px      3.33     16       20         20
+
+    i.e. the gate leaves every non-tearing transition exactly as it found
+    it while still consolidating the ones that do tear.
+    """
+    k = 2 * radius + 1
+    local_hi = F.max_pool2d(depth_t, kernel_size=k, stride=1, padding=radius)
+    local_lo = -F.max_pool2d(-depth_t, kernel_size=k, stride=1, padding=radius)
+    level = 0.5 * (local_lo + local_hi)
+    stretched = (depth_t - level) * gain + level
+    stretched = torch.minimum(torch.maximum(stretched, local_lo), local_hi)
+
+    if min_contrast <= 0:
+        return stretched
+
+    # Only hard-step where the transition would actually TEAR. Measured:
+    # a depth transition gentler than ~1px of disparity per pixel produces
+    # no holes at all (the warp covers it), so hardening it there does
+    # nothing but manufacture new ones - a 3px jump spread over 10px went
+    # from 0 hole pixels to 2, an 8px jump over 20px from 0 to 4, and a
+    # real frame has thousands of such mild transitions (folds, curved
+    # surfaces). That is a large, purely additive cost paid to fix a
+    # handful of genuine silhouettes.
+    #
+    # local_hi - local_lo over a FIXED window is proportional to the
+    # average gradient across that window, so gating on it is gating on
+    # gradient - which is exactly the condition that decides tearing. A
+    # jump spread over more pixels than the window shows proportionally
+    # less contrast within it and correctly falls below the gate.
+    #
+    # Ramped from half the threshold to the threshold rather than switched
+    # on/off: a hard gate would put a discontinuity wherever it flips,
+    # which is precisely the thing being avoided.
+    half = 0.5 * min_contrast
+    weight = ((local_hi - local_lo - half) / half).clamp(0.0, 1.0)
+    return depth_t + weight * (stretched - depth_t)
 
 
 class LiveProgress:
@@ -381,13 +533,22 @@ class DepthCrafterDemo:
         resume: bool = True,
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
-        edge_fill_iters: int = 3,
+        edge_fill_iters: int = 2,
+        sharpen_mode: str = "none",
+        sharpen_radius: int = 6,
+        sharpen_gain: float = 3.0,
+        sharpen_min_contrast_frac: float = 0.15,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
-        applied to each chunk's raw low-res depth before upsampling (see
-        that function's own docstring for the full mechanism/rationale).
-        Validated end-to-end at frac=0.10, iters=3, max_res=768 on real
-        footage - re-verify at other max_res values.
+        applied to each chunk's LOW-RES depth before upsampling - an
+        EXPANSION pass, growing the foreground classification so it still
+        covers the real silhouette after upsampling. Measured to be a
+        ~1px-per-iteration dilation, so one iteration here is one low-res
+        pixel (~2.5 full-res px at max_res=768 on 1080p). It does NOT
+        sharpen: the ramp width is unchanged at every iteration count, so
+        it has no effect on splat tearing - see sharpen_mode for that.
+        Validated defaults 0.10/3 at max_res=768; content-dependent, so
+        re-tune per episode.
 
         window_size/window_overlap control DepthCrafter's OWN internal
         sliding-window inference within a single self.pipe() call - these
@@ -516,6 +677,25 @@ class DepthCrafterDemo:
             "seed": seed,
             "target_fps": target_fps,
             "decode_chunk_size": decode_chunk_size,
+            # BUGFIX: the depth-sharpening params belong in the resume key
+            # too. The chunk files this checkpoint indexes are written
+            # AFTER sharpening (see the write path below - upsample and
+            # sharpen both happen before quantization), so they have the
+            # sharpening baked in. Leaving these out meant a checkpoint
+            # stayed "matching" across a change to them, and a resumed run
+            # silently kept chunks built with the OLD setting while
+            # reporting the new one. Only bit an interrupted or
+            # depth_only/keep_depth_chunks run (a completed run deletes its
+            # checkpoint, and _store_is_complete does check these), but
+            # that is exactly the sweep-the-parameter workflow these are
+            # for. Adding them invalidates existing checkpoints, which is
+            # the correct behavior - those really are stale.
+            "edge_threshold_frac": edge_threshold_frac,
+            "edge_fill_iters": edge_fill_iters,
+            "sharpen_mode": sharpen_mode,
+            "sharpen_radius": sharpen_radius,
+            "sharpen_gain": sharpen_gain,
+            "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
         }
 
         output_start = 0
@@ -719,65 +899,134 @@ class DepthCrafterDemo:
                     "max=", np.nanmax(result),
                 )
 
-                # ROOT-CAUSE FIX for the silhouette comb/notch artifact (see
-                # _edge_threshold_fill's own docstring for the full
-                # mechanism). Earlier attempts in this same investigation
-                # (nearest vs bilinear upsampling, crack-closing, z-buffer
-                # splat, plain depth-map sharpening/dilation) were all
-                # symptom-side patches on top of an unmodified soft depth
-                # signal, and none of them fixed it - it's present
-                # identically in upstream's own unmodified
-                # camel_splatting_results.jpg demo asset. This instead
-                # reverses the depth model's own soft-edge output at the
-                # source, on the raw low-res chunk, before any upsampling -
-                # validated end-to-end (real splat + real stage-2
-                # inpainting) on real footage, not just visual inspection.
+                # UPSAMPLE-THEN-FILL, not fill-then-upsample: silhouette
+                # curvature (e.g. a character's round head) gets aliased
+                # into a low-res-grid staircase the moment depth is computed
+                # at max_res - a real, unavoidable undersampling artifact,
+                # not noise (confirmed directly: a synthetic circle with a
+                # perfectly clean, already-hard boundary run through this
+                # exact pipeline still produces the identical jagged
+                # crescent). Filling the LOW-RES grid (the old order) can
+                # only reclassify which coarse low-res pixel is foreground -
+                # it can never add curvature resolution the grid never had,
+                # so nearest-vs-bilinear upsampling afterward was always
+                # rendering the same staircase, just with a different pixel
+                # style (blocky vs blurred). Upsampling FIRST with bilinear
+                # instead linearly interpolates BETWEEN adjacent low-res
+                # samples (the same trick marching-squares uses to find a
+                # sub-pixel contour crossing from a coarse grid), giving a
+                # smoother, less-faceted estimate of the true boundary
+                # position than nearest's hard snap-to-low-res-pixel - not a
+                # full fix (curvature sharper than a straight line between
+                # two adjacent low-res samples still can't be recovered),
+                # but strictly better information than nearest ever had.
+                # _edge_threshold_fill then re-hardens that bilinear-softened
+                # edge on the FULL-RES grid instead of the low-res one - NOTE
+                # its 4-neighbor-per-pass reach is now in FULL-RES pixels,
+                # not low-res ones, so edge_fill_iters may need to be re-
+                # tuned (larger) to close the same real-world gap width the
+                # old low-res-grid version did at the validated iters=3.
+                #
+                # WHICH re-hardening operator runs is sharpen_mode:
+                #   "none"    - leave the upsampled depth as it is.
+                #   "stretch" - _position_preserving_sharpen, which hardens
+                #     about the LOCAL plateau midpoint, leaving the
+                #     boundary's sub-pixel position untouched. This is the
+                #     only one of the two that affects splat tearing.
+                #
+                # _edge_threshold_fill is deliberately NOT an option here:
+                # measured, its gap structure is identical to doing nothing
+                # at every iteration count, because max/min-of-neighbours
+                # propagation TRANSLATES a ramp rather than narrowing it
+                # (the neighbour one pixel away is not the plateau, it is
+                # the next ramp value). Its only real effect is dilation,
+                # which is a genuinely useful but different job, and it now
+                # runs where that job belongs - on the low-res depth,
+                # before upsampling, driven by edge_fill_iters.
+                #
                 # edge_threshold only needs a global min/max, computed
-                # straight from the numpy array - no need to hold the whole
-                # chunk on GPU just for a scalar reduction (this itself was
-                # an unbatched full-chunk GPU allocation, found via the same
-                # audit that found the depth-quantization/splatting-pass
-                # instances below).
+                # straight from the raw low-res numpy array before any GPU
+                # work - bilinear upsampling can't produce values outside
+                # the range of the samples it interpolates between, so the
+                # low-res range is exactly the full-res range too. (Unused
+                # by "stretch", which derives its level locally per pixel -
+                # that locality is the entire point.)
                 edge_threshold = float(result.min()) + edge_threshold_frac * (
                     float(result.max()) - float(result.min())
                 )
-                # Same OOM bug class found (and fixed) 3x already this
-                # session in the DepthCrafter submodule, this time in our
-                # own code: _edge_threshold_fill is a pure per-frame spatial
-                # op (up/down/left/right neighbor shifts within each frame,
-                # no cross-frame dependency at all) but was being run on the
-                # WHOLE chunk's tensor_res at once - fine at the old small
-                # CHUNK_SIZE, OOMs at a large one. Batch it by
-                # decode_chunk_size like everything else, bit-identical
-                # result since each frame is independent - and move each
-                # batch to GPU just-in-time here too, instead of the whole
-                # chunk upfront.
-                edge_filled_batches = []
+                # Absolute contrast gate for "stretch", from the same
+                # per-chunk range edge_threshold uses. NOTE the same
+                # caveat applies: this is the CHUNK's range, not the
+                # episode-global one (which isn't known until the pass
+                # finishes), so the gate can sit slightly differently
+                # between chunks of very different depth content.
+                sharpen_min_contrast = sharpen_min_contrast_frac * (
+                    float(result.max()) - float(result.min())
+                )
+                if sharpen_mode not in ("none", "stretch"):
+                    raise ValueError(
+                        f"sharpen_mode must be 'none' or 'stretch', got {sharpen_mode!r}"
+                    )
+                print(
+                    f"    expand (full-res): {edge_fill_iters}px each way"
+                    f" (threshold_frac={edge_threshold_frac})"
+                )
+                print(f"    depth sharpen: mode={sharpen_mode}", end="")
+                if sharpen_mode == "stretch":
+                    print(
+                        f", radius={sharpen_radius}, gain={sharpen_gain}"
+                        f", min_contrast_frac={sharpen_min_contrast_frac}"
+                    )
+                else:
+                    print()
+                # Bounded by decode_chunk_size (not the whole chunk at once)
+                # to avoid the OOM bug class found/fixed elsewhere in this
+                # file - upsample and edge-fill are both pure per-frame
+                # spatial ops with no cross-frame dependency, so batching is
+                # bit-identical to doing the whole chunk in one shot. Single
+                # combined loop (not two separate passes like the old fill-
+                # then-upsample order) since there's no longer a
+                # low-res-resolution intermediate tensor worth keeping
+                # around between the two steps.
+                result_batches = []
                 for i in range(0, result.shape[0], decode_chunk_size):
                     batch_gpu = torch.from_numpy(result[i : i + decode_chunk_size]).unsqueeze(1).float().cuda()
-                    edge_filled_batches.append(
-                        _edge_threshold_fill(batch_gpu, edge_threshold, edge_fill_iters)
-                    )
-                tensor_res = torch.cat(edge_filled_batches, dim=0)
-                # 5th instance of the same OOM bug class this session:
-                # F.interpolate is a pure per-frame spatial resize (nearest
-                # neighbor, no cross-frame dependency) but was upsampling
-                # the WHOLE chunk to full original resolution in one shot -
-                # at CHUNK_SIZE=1440 and 1080x1920 that's an ~11.1GiB tensor
-                # on its own, both on GPU (the interpolate call itself) and
-                # then again in system RAM (the .cpu().numpy() copy right
-                # after). Batch it, converting each batch to numpy
-                # immediately so the GPU-side tensor for that batch is
-                # freed before the next one starts, bounding both VRAM and
-                # system RAM by decode_chunk_size instead of CHUNK_SIZE.
-                result_batches = []
-                for i in range(0, tensor_res.shape[0], decode_chunk_size):
                     batch_upsampled = F.interpolate(
-                        tensor_res[i : i + decode_chunk_size],
+                        batch_gpu,
                         size=(original_height, original_width),
-                        mode="nearest",
+                        mode="bilinear",
+                        align_corners=False,
                     )
-                    batch_np = batch_upsampled[:, 0].cpu().numpy()
+                    if sharpen_mode == "stretch":
+                        batch_filled = _position_preserving_sharpen(
+                            batch_upsampled, sharpen_radius, sharpen_gain,
+                            min_contrast=sharpen_min_contrast,
+                        )
+                    else:
+                        batch_filled = batch_upsampled
+
+                    # EXPANSION, at FULL res so one iteration is one
+                    # FULL-RES pixel. It used to run on the low-res depth,
+                    # where the smallest possible step was one low-res
+                    # pixel (~2.5 full-res px at max_res=768 on 1080p) -
+                    # too coarse to ask for the 1px of growth that the
+                    # leftover strays actually need. Runs after the
+                    # sharpen, so a hard edge goes in and a hard edge
+                    # comes out, just moved.
+                    # Both directions at the same count. They are kept as
+                    # separate passes because they are separate trades
+                    # (see EXPAND_RIGHT/EXPAND_OTHER) - tuning on real
+                    # footage just landed both at the same value, so they
+                    # share one knob. Splitting them again is a one-line
+                    # change if some scene ever needs them to differ.
+                    if edge_fill_iters > 0:
+                        batch_filled = _edge_threshold_fill(
+                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_RIGHT
+                        )
+                        batch_filled = _edge_threshold_fill(
+                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_OTHER
+                        )
+                    batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
                     # same audit - a full-chunk np.isfinite(result) boolean
                     # array is "only" ~3GiB at this CHUNK_SIZE, versus the
@@ -862,7 +1111,10 @@ class DepthCrafterDemo:
                     output_start, list(chunk_files), list(chunk_meta), global_min, global_max,
                 )
 
-                del frames, result, tensor_res
+                # (no tensor_res any more - the upsample-then-sharpen
+                # reorder merged the two passes into one loop, so there is
+                # no whole-chunk intermediate tensor left to free here.)
+                del frames, result
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -1198,6 +1450,7 @@ def DepthSplatting(
     whenever stride > 1, i.e. whenever target_fps < source fps). This reads
     the same strided frame indices back out of the source video, so image
     and depth stay paired.
+
     """
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     native_num_frames = len(vid_reader)
@@ -1345,9 +1598,9 @@ def DepthSplatting(
             with torch.no_grad():
                 right_video, occlusion_mask = stereo_projector(left_video, disp_map)
 
-            # OPTIMIZATION: write only the two arrays the inpaint stage
-            # reads - no grid assembly, no depth-vis channel, no 3x
-            # replication of a single-channel mask, no color-space convert.
+            # OPTIMIZATION: write only the arrays the inpaint stage reads -
+            # no grid assembly, no depth-vis channel, no 3x replication of a
+            # single-channel mask, no color-space convert.
             right_u8 = (
                 right_video.clamp(0, 1).mul(255).to(torch.uint8)
                 .permute(0, 2, 3, 1).contiguous().cpu().numpy()
@@ -1356,7 +1609,6 @@ def DepthSplatting(
                 occlusion_mask.clamp(0, 1).mul(255).to(torch.uint8)
                 .squeeze(1).contiguous().cpu().numpy()
             )
-
             warp_store[sample_start : sample_start + n] = right_u8
             mask_store[sample_start : sample_start + n] = mask_u8
 
@@ -1433,7 +1685,11 @@ def main(
     disp_tolerance: float = 1.0,
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
-    edge_fill_iters: int = 3,
+    edge_fill_iters: int = 2,
+    sharpen_mode: str = "none",
+    sharpen_radius: int = 6,
+    sharpen_gain: float = 3.0,
+    sharpen_min_contrast_frac: float = 0.15,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
 ):
@@ -1450,11 +1706,19 @@ def main(
     transitions. window_overlap MUST be less than window_size - that's the
     model's own internal windowing constraint.
 
-    edge_threshold_frac/edge_fill_iters: tune the silhouette comb/notch
-    fix (see _edge_threshold_fill's docstring). These are very likely
-    content-dependent - different anime episodes have different amounts
-    of contrast/detail at silhouette edges - re-tune per-episode rather
-    than assuming the validated defaults (0.10, 3) transfer directly.
+    sharpen_mode: which operator re-hardens the depth edge after the
+    bilinear upsample to full res.
+      "none" (default): leave the upsampled depth alone. Combined with
+        edge_fill_iters' low-res expansion pass, this is the pipeline's
+        original behavior (modulo the upsample now being bilinear rather
+        than nearest).
+      "stretch": _position_preserving_sharpen, tuned by sharpen_radius/
+        sharpen_gain. Hardens about the LOCAL plateau midpoint, leaving
+        the boundary's sub-pixel position where it was. Measured 2.4-4.6x
+        lower boundary-position error and a smaller halo than edge_fill,
+        and its knobs barely need tuning (radius is insensitive above the
+        ramp width; gain=3 sharpens at zero positional cost). See
+        _position_preserving_sharpen's docstring for the numbers.
 
     resume: continue a previous run's depth pass from its checkpoint under
     {output_dir}/.depth_checkpoint if the parameters match (see
@@ -1493,6 +1757,10 @@ def main(
         "decode_chunk_size": decode_chunk_size,
         "edge_threshold_frac": edge_threshold_frac,
         "edge_fill_iters": edge_fill_iters,
+        "sharpen_mode": sharpen_mode,
+        "sharpen_radius": sharpen_radius,
+        "sharpen_gain": sharpen_gain,
+        "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
     }
     if resume and _store_is_complete(output_dir, store_params):
         print(f"==> Stage 1 already complete for these params - reusing existing store at {output_dir}")
@@ -1531,6 +1799,10 @@ def main(
         decode_chunk_size=decode_chunk_size,
         edge_threshold_frac=edge_threshold_frac,
         edge_fill_iters=edge_fill_iters,
+        sharpen_mode=sharpen_mode,
+        sharpen_radius=sharpen_radius,
+        sharpen_gain=sharpen_gain,
+        sharpen_min_contrast_frac=sharpen_min_contrast_frac,
     )
 
     if depth_only:

@@ -101,14 +101,53 @@ ATTENTION_SLICING="${ATTENTION_SLICING:-True}"
 # to stage 2's per-iteration diffusion cost. Set False to fall back to the
 # original uncompressed format.
 COMPRESS_STORE="${COMPRESS_STORE:-True}"
-# Silhouette comb/notch artifact fix (see _edge_threshold_fill's docstring
-# in depth_splatting_inference.py for the full mechanism) - reverses the
-# depth model's own soft-edge output before upsampling. Validated at these
-# defaults on real footage at MAX_RES=768 specifically - likely needs
-# re-tuning per anime episode (different silhouette contrast/detail) and
-# re-verifying at other MAX_RES values.
+# EXPANSION of the foreground classification, at FULL res (one iteration =
+# one full-res pixel, applied each way). Needed because the depth-derived
+# foreground is often slightly SMALLER than the real character - the
+# low-res depth grid can't resolve the true silhouette - which leaves
+# character pixels misclassified as background, warped with BACKGROUND
+# disparity, i.e. left in the wrong place.
+#
+# Internally this is two directional passes, because the directions are
+# different trades (the warp is flow = -disp, so objects shift LEFT and
+# the disocclusion only ever opens on an object's RIGHT):
+#   rightward growth turns into hole that gets repainted - it fixes the
+#     side where misclassified pixels sit exposed on background.
+#   left/up/down growth smears the character over background that nothing
+#     repaints - that smear is the "aura" - but it does clean up the
+#     un-shifted 1px fringe left above/below a silhouette.
+# Tuning on real footage landed both at the same value, so they share one
+# knob. It does NOT sharpen - ramp width is unchanged at every iteration
+# count, so it has no effect on splat tearing; see SHARPEN_MODE for that.
+EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-2}"
+# Which depth values count as foreground for the expansion above, as a
+# fraction of the chunk's own depth range. Only pixels above this take the
+# grow-outward branch.
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
-EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
+
+# Optional re-hardening of the depth edge AFTER upsampling to full res.
+# "none" (default) leaves it alone - that plus EDGE_FILL_ITERS above is
+# the pipeline's original behavior (modulo bilinear vs nearest upsample).
+# "stretch" = _position_preserving_sharpen: hardens about the LOCAL
+# plateau midpoint, so the boundary's sub-pixel position is left where it
+# is. This is the only knob that affects splat TEARING (the shredded
+# 1px-on/1px-off holes along silhouettes) - it drives the number of
+# intermediate disparity levels toward zero, and tearing is one gap per
+# level. SHARPEN_* only apply to "stretch": radius just needs to be >= the
+# ramp width (insensitive past that); gain=3 sharpens at zero positional
+# cost, while a very high gain is what actually collapses the tearing.
+SHARPEN_MODE="${SHARPEN_MODE:-none}"
+SHARPEN_RADIUS="${SHARPEN_RADIUS:-6}"
+SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
+# Contrast gate for "stretch": leave any transition weaker than this
+# fraction of the depth range completely alone. Without it, a high
+# SHARPEN_GAIN hard-steps every mild depth change in the frame (folds,
+# curved surfaces) and each one then produces its own small hole where the
+# warp previously covered it fine - measured as a large, purely additive
+# increase in mask area. 0 disables the gate.
+SHARPEN_MIN_CONTRAST_FRAC="${SHARPEN_MIN_CONTRAST_FRAC:-0.15}"
+
+
 
 # Keep the depth checkpoint around after a successful run instead of
 # deleting it (both the per-chunk files as splatting consumes them, and the
@@ -230,6 +269,10 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
+        --sharpen_mode="$SHARPEN_MODE" \
+        --sharpen_radius="$SHARPEN_RADIUS" \
+        --sharpen_gain="$SHARPEN_GAIN" \
+        --sharpen_min_contrast_frac="$SHARPEN_MIN_CONTRAST_FRAC" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \
         2>&1 | tee "$STAGE1_LOG"
 }
