@@ -28,6 +28,17 @@ from splat_store import open_store
 from chunked_attention import enable_chunked_attention
 
 
+# Right-eye .mkv encode settings, used by FFmpegSegmentWriter (per-chunk) and
+# _concat_segments (the final join re-encode) - both need to match, since the
+# join re-encodes the already-written segments one more time. Override per run
+# via main()'s encode_preset/encode_crf kwargs (Fire CLI: --encode_preset=...
+# --encode_crf=...); these are just the defaults. See FFmpegSegmentWriter's
+# docstring for why preset (not crf) was the actual root cause of banding on
+# dark/low-contrast content.
+ENCODE_PRESET = "slow"
+ENCODE_CRF = 12
+
+
 def _format_duration(seconds: float) -> str:
     seconds = max(int(seconds), 0)
     h, rem = divmod(seconds, 3600)
@@ -374,19 +385,10 @@ class FFmpegSegmentWriter:
     zero drops/dupes, uniform output timing.
     """
 
-    # preset=fast, not veryfast: root-caused by isolating the actual final
-    # encode step against a kept splat store, feeding the exact same raw
-    # lossless warp frames through nothing but a bare libx264 pass with
-    # different settings. crf alone (even crf=8) and colorspace tagging
-    # made no real difference - it was specifically `-preset veryfast`
-    # cutting corners (weaker mode decisions/RDO) that this dark, low-
-    # contrast content needs and doesn't have room to lose. `-preset fast`
-    # at the ORIGINAL crf=16 visually matches an untouched single-generation
-    # encode of the real source at the same settings - no bitrate increase,
-    # no extra filter, just an encoder preset actually suited to an offline
-    # quality-sensitive pipeline instead of one meant for real-time/low-
-    # latency encoding.
-    def __init__(self, path, fps, width, height, crf=16):
+    # preset=veryfast was root-caused as the source of banding on dark/low-
+    # contrast content (weaker mode decisions/RDO), not crf - see ENCODE_PRESET/
+    # ENCODE_CRF above for the current defaults and how to override them.
+    def __init__(self, path, fps, width, height, crf=ENCODE_CRF, preset=ENCODE_PRESET):
         self.path = path
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
@@ -394,7 +396,7 @@ class FFmpegSegmentWriter:
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "-",
             "-an",
-            "-c:v", "libx264", "-preset", "fast", "-crf", str(crf),
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-pix_fmt", "yuv420p",
             "-f", "matroska",
             path,
@@ -412,7 +414,7 @@ class FFmpegSegmentWriter:
             raise RuntimeError(f"ffmpeg exited with code {ret} while writing {self.path}")
 
 
-def _concat_segments(segment_paths, output_path, fps, width, height):
+def _concat_segments(segment_paths, output_path, fps, width, height, crf=ENCODE_CRF, preset=ENCODE_PRESET):
     """Stitch segments (all encoded with identical settings by
     FFmpegSegmentWriter) into a single output file.
 
@@ -444,10 +446,9 @@ def _concat_segments(segment_paths, output_path, fps, width, height):
         "-s", f"{width}x{height}", "-r", str(fps),
         "-i", "-",
         "-an",
-        # preset=fast - see FFmpegSegmentWriter's __init__ for the measured
-        # reasoning (same settings, must match - this re-encodes the
-        # already-written segments one more time at the join).
-        "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+        # must match FFmpegSegmentWriter's settings - this re-encodes the
+        # already-written segments one more time at the join.
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
         "-pix_fmt", "yuv420p",
         "-f", "matroska",
         output_path,
@@ -502,6 +503,8 @@ def main(
     dump_frames=None,
     seed=None,
     hole_threshold=127,
+    encode_preset=ENCODE_PRESET,
+    encode_crf=ENCODE_CRF,
 ):
     """NOTE: --input_video_path is now --splat_store_dir - point it at the
     directory depth_splatting_inference.py wrote (warp.npy + mask.npy +
@@ -789,6 +792,8 @@ def main(
         "num_frames": num_frames,
         "width": width,
         "height": height,
+        "encode_preset": encode_preset,
+        "encode_crf": encode_crf,
     }
 
     if bench_iters is not None:
@@ -1170,7 +1175,10 @@ def main(
 
             with phase_timer("ffmpeg_write"):
                 seg_name = f"seg_{len(segments):06d}.mkv"
-                seg_writer = FFmpegSegmentWriter(os.path.join(checkpoint_dir, seg_name), fps, width, height)
+                seg_writer = FFmpegSegmentWriter(
+                    os.path.join(checkpoint_dir, seg_name), fps, width, height,
+                    crf=encode_crf, preset=encode_preset,
+                )
                 seg_writer.write(gen_u8)
                 seg_writer.release()
             segments.append(seg_name)
@@ -1209,7 +1217,7 @@ def main(
 
     right_eye_path = os.path.join(save_dir, f"{video_name}_right.mkv")
     segment_paths = [os.path.join(checkpoint_dir, s) for s in segments]
-    _concat_segments(segment_paths, right_eye_path, fps, width, height)
+    _concat_segments(segment_paths, right_eye_path, fps, width, height, crf=encode_crf, preset=encode_preset)
     shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     print(f"\n==> Right-eye video written to: {right_eye_path}")
@@ -1279,13 +1287,35 @@ def main(
         # which can't consume software frames directly. Assumes a VAAPI
         # render node at /dev/dri/renderD128 - adjust if the combine box's
         # GPU enumerates differently.
-        print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible, VAAPI hwaccel):")
+        # VAAPI's h264_vaapi is a fixed-function encoder with much simpler
+        # mode decision/RDO than libx264 (the exact axis FFmpegSegmentWriter's
+        # veryfast-vs-fast finding above says this content is sensitive on),
+        # so -qp N on VAAPI is NOT quality-equivalent to -crf N on x264 - it
+        # generally needs a noticeably lower number to look as good, and even
+        # then may not fully match. qp below is set to (encode_crf - 4) as a
+        # starting point, not a verified match - A/B a frame straddling a
+        # dark/low-contrast region (same method as the banding investigation)
+        # before trusting it for a real deliverable. The libx264 SBS command
+        # printed first re-encodes with the exact same settings as the right-
+        # eye video itself and is the safer default if combine time isn't a
+        # bottleneck.
+        vaapi_qp = max(encode_crf - 4, 0)
+        print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible, libx264, matches right-eye settings):")
+        print(
+            f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
+            f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
+            f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1[v]" '
+            f'-map "[v]" -map 0:a? -map 0:s? '
+            f'-c:v libx264 -preset {encode_preset} -crf {encode_crf} -c:a copy -c:s copy '
+            f'-metadata:s:v:0 stereo_mode=left_right -y "{sbs_out}"'
+        )
+        print("\n==> Or the same combine offloaded to VAAPI hwaccel (faster, quality not verified - see comment above):")
         print(
             f'    ffmpeg -vaapi_device /dev/dri/renderD128 -i "{src}" -i "{right_eye_path}" -filter_complex '
             f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
             f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1,format=nv12,hwupload[v]" '
             f'-map "[v]" -map 0:a? -map 0:s? '
-            f'-c:v h264_vaapi -qp 18 -c:a copy -c:s copy '
+            f'-c:v h264_vaapi -qp {vaapi_qp} -c:a copy -c:s copy '
             f'-metadata:s:v:0 stereo_mode=left_right -y "{sbs_out}"'
         )
         print("\n==> Or into red/cyan anaglyph (ffmpeg has a built-in filter for this):")
@@ -1293,7 +1323,7 @@ def main(
             f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
             f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
             f'[1:v]setpts=N/({fps}*TB)[right];[left][right]anaglyph=rc" '
-            f'-c:v libx264 -crf 18 "{anaglyph_out}"'
+            f'-c:v libx264 -preset {encode_preset} -crf {encode_crf} "{anaglyph_out}"'
         )
         if stride != 1:
             print(
