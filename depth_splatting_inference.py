@@ -534,9 +534,9 @@ class DepthCrafterDemo:
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
         edge_fill_iters: int = 2,
-        sharpen_mode: str = "none",
+        sharpen_mode: str = "stretch",
         sharpen_radius: int = 6,
-        sharpen_gain: float = 3.0,
+        sharpen_gain: float = 1000.0,
         sharpen_min_contrast_frac: float = 0.15,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
@@ -1686,9 +1686,9 @@ def main(
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 2,
-    sharpen_mode: str = "none",
+    sharpen_mode: str = "stretch",
     sharpen_radius: int = 6,
-    sharpen_gain: float = 3.0,
+    sharpen_gain: float = 1000.0,
     sharpen_min_contrast_frac: float = 0.15,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
@@ -1708,10 +1708,15 @@ def main(
 
     sharpen_mode: which operator re-hardens the depth edge after the
     bilinear upsample to full res.
-      "none" (default): leave the upsampled depth alone. Combined with
-        edge_fill_iters' low-res expansion pass, this is the pipeline's
-        original behavior (modulo the upsample now being bilinear rather
-        than nearest).
+      "stretch" (default): _position_preserving_sharpen. This is what
+        suppresses splat tearing, and the default sharpen_gain of 1000 is
+        deliberate - it is the toggle-contrast limit, which drives the
+        number of intermediate disparity levels to zero, and tearing is
+        one gap per level. Validated on real footage at gain=1000 with
+        min_contrast_frac=0.15.
+      "none": leave the upsampled depth alone - the pipeline's behavior
+        before this fix (modulo the upsample being bilinear now, not
+        nearest).
       "stretch": _position_preserving_sharpen, tuned by sharpen_radius/
         sharpen_gain. Hardens about the LOCAL plateau midpoint, leaving
         the boundary's sub-pixel position where it was. Measured 2.4-4.6x

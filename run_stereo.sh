@@ -125,20 +125,20 @@ EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-2}"
 # grow-outward branch.
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 
-# Optional re-hardening of the depth edge AFTER upsampling to full res.
-# "none" (default) leaves it alone - that plus EDGE_FILL_ITERS above is
-# the pipeline's original behavior (modulo bilinear vs nearest upsample).
-# "stretch" = _position_preserving_sharpen: hardens about the LOCAL
+# Re-hardening of the depth edge AFTER upsampling to full res.
+# "stretch" (default) = _position_preserving_sharpen: hardens about the LOCAL
 # plateau midpoint, so the boundary's sub-pixel position is left where it
 # is. This is the only knob that affects splat TEARING (the shredded
 # 1px-on/1px-off holes along silhouettes) - it drives the number of
 # intermediate disparity levels toward zero, and tearing is one gap per
 # level. SHARPEN_* only apply to "stretch": radius just needs to be >= the
-# ramp width (insensitive past that); gain=3 sharpens at zero positional
-# cost, while a very high gain is what actually collapses the tearing.
-SHARPEN_MODE="${SHARPEN_MODE:-none}"
+# ramp width (insensitive past that, and 6 covers MAX_RES 768 and 1024);
+# GAIN defaults to the toggle-contrast limit, which is what actually
+# collapses the tearing - gain=3 only sharpens, it does not fix it.
+# Set SHARPEN_MODE=none for the pre-fix behavior.
+SHARPEN_MODE="${SHARPEN_MODE:-stretch}"
 SHARPEN_RADIUS="${SHARPEN_RADIUS:-6}"
-SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
+SHARPEN_GAIN="${SHARPEN_GAIN:-1000}"
 # Contrast gate for "stretch": leave any transition weaker than this
 # fraction of the depth range completely alone. Without it, a high
 # SHARPEN_GAIN hard-steps every mild depth change in the frame (folds,
