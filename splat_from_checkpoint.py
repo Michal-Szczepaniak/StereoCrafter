@@ -42,6 +42,7 @@ def main(
     dataset: str = "open",
     keep_depth_chunks: bool = True,
     minutes: float = None,
+    audio_source_path: str = None,
 ):
     """device: "cpu" by default (the point of this script) - pass "cuda" to
     run it on a GPU machine too, e.g. to A/B splatting params quickly
@@ -57,6 +58,9 @@ def main(
     without waiting on (or consuming) the rest of the episode. Converted to
     a frame count using target_fps once it's known (see get_video_info call
     below), then passed through as DepthSplatting's max_frames.
+
+    audio_source_path: see DepthSplatting's own docstring - pass the real
+    original file here if input_video_path is a video-only proxy.
     """
     manifest_path = os.path.join(checkpoint_dir, "manifest.json")
     with open(manifest_path) as f:
@@ -101,6 +105,7 @@ def main(
         device=device,
         keep_depth_chunks=keep_depth_chunks,
         max_frames=max_frames,
+        audio_source_path=audio_source_path,
     )
 
 

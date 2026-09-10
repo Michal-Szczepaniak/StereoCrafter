@@ -17,11 +17,28 @@
 # Usage:
 #   ./prepare_source.sh <input_video> [output_path]
 #
-# Output is always .mkv (needed for TrueHD/DTS audio and PGS subtitles,
-# which get stream-copied through untouched - only the video is
-# re-encoded). Skips the whole job if output_path already exists, since a
-# 4K source at PREPARE_CRF=12/slow is an hours-long job you do not want to
+# Output is video-only (h264, no audio/subtitle streams at all - see below)
+# and always .mkv. Skips the whole job if output_path already exists, since
+# a 4K source at PREPARE_CRF=12/slow is an hours-long job you do not want to
 # accidentally restart - pass FORCE=True to redo it anyway.
+#
+# Video-only, NOT muxed with audio/subs: this file goes straight into
+# depth_splatting_inference.py, whose stage-1 VideoReader is decord, not
+# ffmpeg - and decord bundles its own old, limited libavformat that cannot
+# reliably open real UHD remuxes' TrueHD/DTS audio and PGS subtitle streams
+# at all. A prior version of this script stream-copied those through
+# untouched (-map 0:a? -map 0:s? -c:a copy -c:s copy) and that crashed
+# decord outright: DECORDError "Unable to parse option value -1 as pixel
+# format" / "Cannot create buffer source" - decord's own stream-info probe
+# never even determined the VIDEO stream's pix_fmt, despite the video track
+# itself being plain re-encoded yuv420p h264. Audio/subs for the final
+# deliverable now come from the ORIGINAL file instead, at the stage-3
+# combine step - see run_stereo.sh's auto-prepare block and
+# depth_splatting_inference.py's --audio_source_path.
+#
+# Output path default: next to the INPUT video (same directory), not this
+# repo's source_video/ dir - so run_stereo.sh's auto-prepare step can derive
+# it deterministically from the original path alone.
 #
 # Override any knob via environment variable, e.g.:
 #   PREPARE_CRF=16 PREPARE_PRESET=medium ./prepare_source.sh input.mkv
@@ -39,9 +56,8 @@ if [[ ! -f "$INPUT_VIDEO" ]]; then
 fi
 INPUT_VIDEO="$(cd "$(dirname "$INPUT_VIDEO")" && pwd)/$(basename "$INPUT_VIDEO")"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_NAME="$(basename "${INPUT_VIDEO%.*}")"
-OUTPUT_PATH="${2:-"$REPO_DIR/source_video/${VIDEO_NAME}_prepared.mkv"}"
+OUTPUT_PATH="${2:-"$(dirname "$INPUT_VIDEO")/${VIDEO_NAME}_prepared.mkv"}"
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
 # Match inpainting_inference.py's ENCODE_PRESET/ENCODE_CRF defaults - this
@@ -123,12 +139,13 @@ else
     VIDEO_FILTER="${SCALE_FILTER}format=yuv420p"
 fi
 
-# Every audio and subtitle track, stream-copied untouched - this file is
-# what run_stereo.sh's printed combine commands read `source_video_path`
-# from (see inpainting_inference.py), so whatever ends up in the final SBS
-# deliverable's audio/subs comes from here, not the original 4K remux.
-MAP_ARGS=(-map 0:v:0 -map 0:a? -map 0:s?)
-ENCODE_ARGS=(-c:v libx264 -preset "$PREPARE_PRESET" -crf "$PREPARE_CRF" -c:a copy -c:s copy -y "$OUTPUT_PATH")
+# Video only - no audio, no subtitles (see the module docstring above for
+# why: decord can't reliably open a container carrying TrueHD/DTS/PGS at
+# all, even just to read the video stream). The final SBS deliverable's
+# audio/subs come from the ORIGINAL file instead, via run_stereo.sh passing
+# it as --audio_source_path.
+MAP_ARGS=(-map 0:v:0)
+ENCODE_ARGS=(-c:v libx264 -preset "$PREPARE_PRESET" -crf "$PREPARE_CRF" -an -sn -y "$OUTPUT_PATH")
 
 echo "==> Encoding -> $OUTPUT_PATH (preset=$PREPARE_PRESET crf=$PREPARE_CRF) ..."
 if [[ -e "$VAAPI_DEVICE" ]]; then

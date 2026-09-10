@@ -1398,6 +1398,7 @@ def DepthSplatting(
     device="cuda",
     keep_depth_chunks=False,
     max_frames=None,
+    audio_source_path=None,
 ):
     """Stream saved DepthCrafter depth chunks through the depth-splatting
     stage and write ONLY what the inpainting stage reads - the warped
@@ -1445,6 +1446,17 @@ def DepthSplatting(
     exactly as they were (the per-chunk loop below simply breaks once
     num_frames is reached, before ever touching those files).
 
+    audio_source_path: None (default) records source_video_path itself as
+    the audio/subtitle source for inpainting_inference.py's printed combine
+    commands (the original behavior - one file serves as both the left-eye
+    picture AND the audio/subs passthrough). Pass this when input_video_path
+    is a video-only proxy (e.g. run_stereo.sh's auto-prepare step downscales
+    >1080p sources through prepare_source.sh, which strips audio/subs
+    because decord cannot reliably open some UHD remuxes' TrueHD/DTS/PGS
+    streams at all - see prepare_source.sh's module docstring) so the final
+    deliverable still gets its audio/subs from the real original file
+    instead of silently ending up muted.
+
     FIX (carried over): depth chunk index i was computed from source video
     frame i*stride (DepthCrafter runs on a temporally-subsampled clip
     whenever stride > 1, i.e. whenever target_fps < source fps). This reads
@@ -1486,6 +1498,7 @@ def DepthSplatting(
         height=height,
         width=width,
         source_video_path=os.path.abspath(input_video_path),
+        audio_source_path=os.path.abspath(audio_source_path) if audio_source_path else None,
         params=store_params,
     )
     print(f"==> writing splat store to: {store_dir}")
@@ -1692,6 +1705,7 @@ def main(
     sharpen_min_contrast_frac: float = 0.15,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
+    audio_source_path: Optional[str] = None,
 ):
     """NOTE: --output_video_path is now --output_dir - this stage no longer
     writes an mp4, it writes a directory (splat_store.py's format -
@@ -1746,6 +1760,11 @@ def main(
     GPU box, fetch {output_dir}/.depth_checkpoint/ (manifest.json + the
     quantized depth chunk files) plus the source video elsewhere, then feed
     that checkpoint dir to splat_from_checkpoint.py's --checkpoint_dir.
+
+    audio_source_path: see DepthSplatting's own docstring - pass the real
+    original file here when input_video_path is a video-only proxy, so the
+    stage-3 combine command's audio/subs come from the original instead of
+    silently having none.
     """
     store_params = {
         "input_video_path": os.path.abspath(input_video_path),
@@ -1832,6 +1851,7 @@ def main(
             compress_store=compress_store,
             disp_tolerance=disp_tolerance,
             keep_depth_chunks=keep_depth_chunks,
+            audio_source_path=audio_source_path,
         )
     except Exception:
         print(f"==> Splatting failed - depth checkpoint kept at {checkpoint_dir} for resume")

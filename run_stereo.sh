@@ -38,6 +38,32 @@ OUTPUT_DIR="${2:-"$REPO_DIR/outputs/$VIDEO_NAME"}"
 SPLAT_DIR="$OUTPUT_DIR/splat"
 mkdir -p "$OUTPUT_DIR"
 
+# ---- auto-prepare: >1080p sources go through prepare_source.sh first.
+# Two independent reasons (see prepare_source.sh's own module docstring):
+# every validated knob above was tuned at 1080p SDR, AND decord (stage 1's
+# VideoReader) cannot reliably open some UHD remuxes at all - it fails to
+# even determine the video stream's pix_fmt on files carrying TrueHD/DTS
+# audio or PGS subs (DECORDError "Unable to parse option value -1 as pixel
+# format" / "Cannot create buffer source"), so prepare_source.sh's output is
+# video-only. WORKING_VIDEO (what stage 1 actually reads) and
+# AUDIO_SOURCE_ARGS (what the stage-3 combine command pulls audio/subs from)
+# diverge only in this case - otherwise the same original file serves both,
+# exactly as before this existed.
+AUTO_PREPARE="${AUTO_PREPARE:-True}"
+WORKING_VIDEO="$INPUT_VIDEO"
+AUDIO_SOURCE_ARGS=()
+if [[ "$AUTO_PREPARE" == "True" ]]; then
+    SRC_WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$INPUT_VIDEO")"
+    SRC_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$INPUT_VIDEO")"
+    if [[ "$SRC_WIDTH" -gt 1920 || "$SRC_HEIGHT" -gt 1080 ]]; then
+        PREPARED_VIDEO="$(dirname "$INPUT_VIDEO")/${VIDEO_NAME}_prepared.mkv"
+        echo "==> Source is ${SRC_WIDTH}x${SRC_HEIGHT} (>1080p) - preparing via prepare_source.sh -> $PREPARED_VIDEO"
+        "$REPO_DIR/prepare_source.sh" "$INPUT_VIDEO" "$PREPARED_VIDEO"
+        WORKING_VIDEO="$PREPARED_VIDEO"
+        AUDIO_SOURCE_ARGS=(--audio_source_path "$INPUT_VIDEO")
+    fi
+fi
+
 # ---- weights ----
 SVD_WEIGHTS="${SVD_WEIGHTS:-./weights/stable-video-diffusion-img2vid-xt-1-1}"
 DEPTHCRAFTER_UNET="${DEPTHCRAFTER_UNET:-./weights/DepthCrafter}"
@@ -250,8 +276,9 @@ STAGE1_LOG="$OUTPUT_DIR/stage1.log"
 
 stage1_run() {
     python -u depth_splatting_inference.py \
-        --input_video_path "$INPUT_VIDEO" \
+        --input_video_path "$WORKING_VIDEO" \
         --output_dir "$SPLAT_DIR" \
+        "${AUDIO_SOURCE_ARGS[@]}" \
         --unet_path "$DEPTHCRAFTER_UNET" \
         --pre_trained_path "$SVD_WEIGHTS" \
         --max_res="$MAX_RES" \
