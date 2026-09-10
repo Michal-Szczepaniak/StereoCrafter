@@ -126,6 +126,10 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 # neither affects splat tearing; see SHARPEN_MODE for that.
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 EDGE_FILL_ITERS_OTHER="${EDGE_FILL_ITERS_OTHER:-0}"
+# Which depth values count as foreground for the expansion above, as a
+# fraction of the chunk's own depth range. Only pixels above this take the
+# grow-outward branch.
+EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 
 # Optional re-hardening of the depth edge AFTER upsampling to full res.
 # "none" (default) leaves it alone - that plus EDGE_FILL_ITERS above is
