@@ -217,6 +217,26 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-8}"
 WORK_SCALE="${WORK_SCALE:-1.0}"
 DENOISE_STRENGTH="${DENOISE_STRENGTH:-1.0}"
 MASK_SKIP_THRESHOLD="${MASK_SKIP_THRESHOLD:-}"
+
+# ---- stage-2 fill quality (measured this session against a real 1080p
+# splat store - see inpainting_inference.py's _rescue_failed_fills docstring
+# for the full numbers).
+#
+# PREFILL_OCCLUSION: whether the classical TELEA fill is written into the
+# holes BEFORE the model sees them. True was the old default and is the
+# safe/blurry option: the model then just reproduces the prefill (hole-vs-
+# surrounding detail ratio 0.36, barely above TELEA's own 0.27). False lets
+# it generate real texture (0.84, against 1.00 for the real image) at the
+# cost of cratering to near-black on ~4% of hole pixels - which is what
+# RESCUE_THRESHOLD then repairs. Only worth setting False at WORK_SCALE=1.0;
+# at 0.5 the holes are under one latent pixel and the model does nothing
+# either way.
+#
+# RESCUE_THRESHOLD: per-pixel repair of those craters (empty = off). 0.25 is
+# the measured best point: black<40 drops 4.12% -> 0.08% for a detail cost
+# of 0.84 -> 0.75. Pointless with PREFILL_OCCLUSION=True (nothing to rescue).
+PREFILL_OCCLUSION="${PREFILL_OCCLUSION:-True}"
+RESCUE_THRESHOLD="${RESCUE_THRESHOLD:-}"
 # CLASSICAL_ONLY: skip the SVD diffusion model in stage 2 entirely (never
 # loaded, no VRAM/time cost) - output is just cv2.inpaint(TELEA) over the
 # splat holes. Only makes sense once stage 1's silhouette fix
@@ -324,6 +344,10 @@ stage2_run() {
     if [[ -n "$MASK_SKIP_THRESHOLD" ]]; then
         MASK_SKIP_ARG=(--mask_skip_threshold "$MASK_SKIP_THRESHOLD")
     fi
+    RESCUE_ARG=()
+    if [[ -n "$RESCUE_THRESHOLD" ]]; then
+        RESCUE_ARG=(--rescue_threshold "$RESCUE_THRESHOLD")
+    fi
     python -u inpainting_inference.py \
         --pre_trained_path "$SVD_WEIGHTS" \
         --unet_path "$STEREOCRAFTER_UNET" \
@@ -343,7 +367,9 @@ stage2_run() {
         --vae_force_upcast="$VAE_FORCE_UPCAST" \
         --compile_unet="$COMPILE_UNET" \
         --classical_only="$CLASSICAL_ONLY" \
+        --prefill_occlusion="$PREFILL_OCCLUSION" \
         "${MASK_SKIP_ARG[@]}" \
+        "${RESCUE_ARG[@]}" \
         --chunked_attention="$CHUNKED_ATTENTION" \
         --attention_kv_chunk_size="$ATTENTION_KV_CHUNK_SIZE" \
         --suppress_attention_kernel_warnings="$SUPPRESS_ATTENTION_KERNEL_WARNINGS" \
