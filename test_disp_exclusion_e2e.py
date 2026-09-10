@@ -134,6 +134,11 @@ SHARPEN_RADIUS = 6
 # +265%. Since the comb IS a jitter artifact, 3 is the safe default;
 # raise it only if a ~1.8px soft edge proves too soft for the splat.
 SHARPEN_GAIN = 3.0
+# Only hard-step transitions steep enough to actually TEAR in the warp,
+# as a fraction of the depth range. Without this, a high gain hard-steps
+# every mild depth change too, and each one then produces its own small
+# hole where the warp previously covered it fine. 0 disables the gate.
+SHARPEN_MIN_CONTRAST_FRAC = 0.15
 
 
 def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int]:
@@ -149,7 +154,8 @@ def _production_low_res(height: int, width: int, max_res: int) -> tuple[int, int
     return low_h, low_w
 
 
-def _position_preserving_sharpen(depth: np.ndarray, radius: int, gain: float) -> np.ndarray:
+def _position_preserving_sharpen(depth: np.ndarray, radius: int, gain: float,
+                                 min_contrast: float = 0.0) -> np.ndarray:
     """Re-hardens a soft depth transition WITHOUT moving where it sits.
 
     The whole point (see the comb/aliasing investigation): a low-res depth
@@ -214,7 +220,15 @@ def _position_preserving_sharpen(depth: np.ndarray, radius: int, gain: float) ->
     local_lo = cv2.erode(depth, kernel)
     local_hi = cv2.dilate(depth, kernel)
     level = 0.5 * (local_lo + local_hi)
-    return np.clip((depth - level) * gain + level, local_lo, local_hi)
+    stretched = np.clip((depth - level) * gain + level, local_lo, local_hi)
+    if min_contrast <= 0:
+        return stretched
+    # Gate: leave transitions too gentle to tear completely alone (see the
+    # production copy in depth_splatting_inference.py for the measurements).
+    # Ramped, not switched, so the gate boundary isn't itself an edge.
+    half = 0.5 * min_contrast
+    weight = np.clip((local_hi - local_lo - half) / half, 0.0, 1.0)
+    return depth + weight * (stretched - depth)
 
 
 def _depth_boundary_band(depth_2d: np.ndarray, band_radius: int, rel_thresh: float = 0.02) -> np.ndarray:
@@ -321,7 +335,12 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
 
     if mode == "stretch":
         upsampled = upsampled_t[0, 0].cpu().numpy()
-        return _position_preserving_sharpen(upsampled, SHARPEN_RADIUS, SHARPEN_GAIN)
+        min_contrast = SHARPEN_MIN_CONTRAST_FRAC * (
+            float(low_res.max()) - float(low_res.min())
+        )
+        return _position_preserving_sharpen(
+            upsampled, SHARPEN_RADIUS, SHARPEN_GAIN, min_contrast
+        )
 
     if mode == "edge_fill":
         # threshold from the low-res range - bilinear upsampling can't

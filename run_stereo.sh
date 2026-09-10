@@ -124,6 +124,13 @@ EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 SHARPEN_MODE="${SHARPEN_MODE:-edge_fill}"
 SHARPEN_RADIUS="${SHARPEN_RADIUS:-6}"
 SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
+# Contrast gate for "stretch": leave any transition weaker than this
+# fraction of the depth range completely alone. Without it, a high
+# SHARPEN_GAIN hard-steps every mild depth change in the frame (folds,
+# curved surfaces) and each one then produces its own small hole where the
+# warp previously covered it fine - measured as a large, purely additive
+# increase in mask area. 0 disables the gate.
+SHARPEN_MIN_CONTRAST_FRAC="${SHARPEN_MIN_CONTRAST_FRAC:-0.15}"
 
 # EXPERIMENTAL, off by default (radius<=0 skips it entirely - see
 # _guided_filter_batch's docstring in depth_splatting_inference.py). When
@@ -266,6 +273,7 @@ stage1_run() {
         --sharpen_mode="$SHARPEN_MODE" \
         --sharpen_radius="$SHARPEN_RADIUS" \
         --sharpen_gain="$SHARPEN_GAIN" \
+        --sharpen_min_contrast_frac="$SHARPEN_MIN_CONTRAST_FRAC" \
         --guided_filter_radius="$GUIDED_FILTER_RADIUS" \
         --guided_filter_eps="$GUIDED_FILTER_EPS" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \

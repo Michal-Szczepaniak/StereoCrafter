@@ -127,7 +127,7 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     return current
 
 
-def _position_preserving_sharpen(depth_t, radius, gain):
+def _position_preserving_sharpen(depth_t, radius, gain, min_contrast=0.0):
     """depth_t: [T,1,H,W] tensor, FULL-RES, already bilinear-upsampled.
     Re-hardens the soft transition WITHOUT moving where it sits - the
     alternative to _edge_threshold_fill.
@@ -174,14 +174,59 @@ def _position_preserving_sharpen(depth_t, radius, gain):
     (hair strands). gain: 3 narrows the edge ~6.3px -> ~1.8px at zero
     positional cost; higher buys a harder edge but adds row-to-row jitter
     (gain=6 +35%, gain=12 +130%, gain=inf, the classic morphological
-    toggle-contrast operator, +265%).
+    toggle-contrast operator, +265%). Very high gain is what actually
+    suppresses splat tearing (it drives the count of intermediate
+    disparity levels to zero, and tearing is one gap per level), but only
+    together with min_contrast - see below.
+
+    min_contrast: absolute (same units as depth_t) local-contrast
+    threshold below which this leaves the input alone entirely. 0 disables
+    the gate. Callers normally pass a fraction of the chunk's own depth
+    range. Without it, high gain hard-steps EVERY mild depth transition in
+    the frame, each of which then produces its own small hole where the
+    warp previously covered it fine. Measured, gate as a fraction of the
+    full depth range:
+
+        jump/spread   gradient   raw   ungained   gate=0.15
+        3px / 10px      0.30      0        2          0
+        8px / 20px      0.40      0        4          0
+        12px / 10px     1.20      4       12         12
+        20px / 6px      3.33     16       20         20
+
+    i.e. the gate leaves every non-tearing transition exactly as it found
+    it while still consolidating the ones that do tear.
     """
     k = 2 * radius + 1
     local_hi = F.max_pool2d(depth_t, kernel_size=k, stride=1, padding=radius)
     local_lo = -F.max_pool2d(-depth_t, kernel_size=k, stride=1, padding=radius)
     level = 0.5 * (local_lo + local_hi)
     stretched = (depth_t - level) * gain + level
-    return torch.minimum(torch.maximum(stretched, local_lo), local_hi)
+    stretched = torch.minimum(torch.maximum(stretched, local_lo), local_hi)
+
+    if min_contrast <= 0:
+        return stretched
+
+    # Only hard-step where the transition would actually TEAR. Measured:
+    # a depth transition gentler than ~1px of disparity per pixel produces
+    # no holes at all (the warp covers it), so hardening it there does
+    # nothing but manufacture new ones - a 3px jump spread over 10px went
+    # from 0 hole pixels to 2, an 8px jump over 20px from 0 to 4, and a
+    # real frame has thousands of such mild transitions (folds, curved
+    # surfaces). That is a large, purely additive cost paid to fix a
+    # handful of genuine silhouettes.
+    #
+    # local_hi - local_lo over a FIXED window is proportional to the
+    # average gradient across that window, so gating on it is gating on
+    # gradient - which is exactly the condition that decides tearing. A
+    # jump spread over more pixels than the window shows proportionally
+    # less contrast within it and correctly falls below the gate.
+    #
+    # Ramped from half the threshold to the threshold rather than switched
+    # on/off: a hard gate would put a discontinuity wherever it flips,
+    # which is precisely the thing being avoided.
+    half = 0.5 * min_contrast
+    weight = ((local_hi - local_lo - half) / half).clamp(0.0, 1.0)
+    return depth_t + weight * (stretched - depth_t)
 
 
 def _guided_filter_batch(guide_rgb: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
@@ -537,6 +582,7 @@ class DepthCrafterDemo:
         sharpen_mode: str = "edge_fill",
         sharpen_radius: int = 6,
         sharpen_gain: float = 3.0,
+        sharpen_min_contrast_frac: float = 0.15,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's depth AFTER it's bilinear-upsampled to full
@@ -692,6 +738,7 @@ class DepthCrafterDemo:
             "sharpen_mode": sharpen_mode,
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
+            "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
         }
 
         output_start = 0
@@ -947,13 +994,25 @@ class DepthCrafterDemo:
                 edge_threshold = float(result.min()) + edge_threshold_frac * (
                     float(result.max()) - float(result.min())
                 )
+                # Absolute contrast gate for "stretch", from the same
+                # per-chunk range edge_threshold uses. NOTE the same
+                # caveat applies: this is the CHUNK's range, not the
+                # episode-global one (which isn't known until the pass
+                # finishes), so the gate can sit slightly differently
+                # between chunks of very different depth content.
+                sharpen_min_contrast = sharpen_min_contrast_frac * (
+                    float(result.max()) - float(result.min())
+                )
                 if sharpen_mode not in ("edge_fill", "stretch"):
                     raise ValueError(
                         f"sharpen_mode must be 'edge_fill' or 'stretch', got {sharpen_mode!r}"
                     )
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
                 if sharpen_mode == "stretch":
-                    print(f", radius={sharpen_radius}, gain={sharpen_gain}")
+                    print(
+                        f", radius={sharpen_radius}, gain={sharpen_gain}"
+                        f", min_contrast_frac={sharpen_min_contrast_frac}"
+                    )
                 else:
                     print(f", threshold_frac={edge_threshold_frac}, iters={edge_fill_iters}")
                 # Bounded by decode_chunk_size (not the whole chunk at once)
@@ -976,7 +1035,8 @@ class DepthCrafterDemo:
                     )
                     if sharpen_mode == "stretch":
                         batch_filled = _position_preserving_sharpen(
-                            batch_upsampled, sharpen_radius, sharpen_gain
+                            batch_upsampled, sharpen_radius, sharpen_gain,
+                            min_contrast=sharpen_min_contrast,
                         )
                     else:
                         batch_filled = _edge_threshold_fill(
@@ -1721,6 +1781,7 @@ def main(
     sharpen_mode: str = "edge_fill",
     sharpen_radius: int = 6,
     sharpen_gain: float = 3.0,
+    sharpen_min_contrast_frac: float = 0.15,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1796,6 +1857,7 @@ def main(
         "sharpen_mode": sharpen_mode,
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
+        "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1839,6 +1901,7 @@ def main(
         sharpen_mode=sharpen_mode,
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,
+        sharpen_min_contrast_frac=sharpen_min_contrast_frac,
     )
 
     if depth_only:
