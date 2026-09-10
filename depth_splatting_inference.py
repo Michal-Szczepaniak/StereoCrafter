@@ -74,8 +74,9 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     flood-fill re-evaluated fresh every pass against
     each pixel's CURRENT (just-updated) value - not a one-time
     classification:
-      - a pixel currently <= threshold takes the MIN of its 4 literal
-        attached neighbors (up/down/left/right) - but only neighbors that
+      - a pixel currently <= threshold takes the MIN of its attached
+        neighbors (see the alternating 8/4-connected neighbourhood in the
+        loop below) - but only neighbors that
         are THEMSELVES currently above threshold count as candidates.
         Excluding same-side neighbors is required: without it, two
         adjacent below-threshold pixels just keep copying each other's low
@@ -85,7 +86,7 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         not a hypothetical. If a pixel has no above-threshold neighbor at
         all (real background, not near any edge), it just keeps its
         current value that pass.
-      - a pixel currently > threshold takes the MAX of all 4 neighbors,
+      - a pixel currently > threshold takes the MAX of all its neighbors,
         unconditionally - no exclusion needed on this side, since a plain
         MAX can only ever grow the high region pass over pass, never get
         stuck the way MIN does on a mutually-reinforcing low pair.
@@ -104,14 +105,41 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     full-res pixels; re-tune/re-verify n_iters under this order before
     trusting the old default's value un-scaled.
     """
-    current = depth_t
-    for _ in range(n_iters):
-        up = F.pad(current, (0, 0, 1, 0), mode="replicate")[:, :, :-1, :]
-        down = F.pad(current, (0, 0, 0, 1), mode="replicate")[:, :, 1:, :]
-        left = F.pad(current, (1, 0, 0, 0), mode="replicate")[:, :, :, :-1]
-        right = F.pad(current, (0, 1, 0, 0), mode="replicate")[:, :, :, 1:]
+    def shift(t, dy, dx):
+        """t[y+dy, x+dx], replicate-padded at the borders."""
+        pad = (max(-dx, 0), max(dx, 0), max(-dy, 0), max(dy, 0))  # l, r, t, b
+        p = F.pad(t, pad, mode="replicate")
+        h, w = t.shape[-2], t.shape[-1]
+        y0, x0 = max(dy, 0), max(dx, 0)
+        return p[:, :, y0:y0 + h, x0:x0 + w]
 
-        neighbors = torch.stack([up, down, left, right], dim=0)
+    current = depth_t
+    for it in range(n_iters):
+        # Alternate an 8-connected (square) pass with a 4-connected
+        # (diamond) one, SQUARE FIRST. Each shape on its own is badly
+        # anisotropic - measured growth in radius on a disc, worst
+        # direction vs best:
+        #     iters=1  diamond  0.25px .. 1.50px   (6.0x)
+        #     iters=1  square   0.75px .. 2.25px   (3.0x)
+        #     iters=2  diamond  1.00px .. 2.75px   (2.75x)
+        #     iters=2  square   1.75px .. 3.50px   (2.00x)
+        #     iters=2  alternating                 (1.57x)
+        #     iters=3  alternating                 (1.50x)
+        # Worst-direction growth is what matters here, since the mask
+        # fails wherever it grew least, and a curved silhouette sweeps
+        # through every direction. A 4-neighbour pass cannot grow a pixel
+        # that touches the foreground only at a CORNER, which is most of a
+        # round edge - hence the 0.25px worst case that let a mask stop
+        # just short of a character's head. Alternating approximates an
+        # octagon, far closer to a disc than either shape alone, and
+        # starting with the square gets the better worst case at
+        # n_iters=1 too (dilation composes order-independently, so it
+        # costs nothing at higher counts).
+        offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        if it % 2 == 0:
+            offsets += [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+        neighbors = torch.stack([shift(current, dy, dx) for dy, dx in offsets], dim=0)
         neighbor_is_bg = neighbors <= threshold
 
         pos_inf = torch.finfo(neighbors.dtype).max
