@@ -50,7 +50,7 @@ def _format_duration(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
-def _edge_threshold_fill(depth_t, threshold, n_iters):
+def _edge_threshold_fill(depth_t, threshold, n_iters, offsets):
     """depth_t: [T,1,H,W] tensor. Called on the FULL-RES, already-bilinear-
     upsampled depth (see the call site in DepthCrafterDemo.infer()) - NOT
     the low-res raw depth the name/older comments here once implied. Each
@@ -113,38 +113,15 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         y0, x0 = max(dy, 0), max(dx, 0)
         return p[:, :, y0:y0 + h, x0:x0 + w]
 
-    # DIRECTIONAL, not isotropic: grow the foreground ONLY to the right,
-    # and not at all vertically.
+    # `offsets` selects WHICH way the foreground grows. It is directional
+    # by design - see EXPAND_RIGHT / EXPAND_OTHER below the function.
     #
-    # The warp is `flow = -disp` (see _forward_legacy_cuda_splat), so
-    # higher disparity shifts LEFT: an object moves left and the
-    # disocclusion opens on its RIGHT. That makes the two sides behave
-    # completely differently when the depth-derived region is slightly
-    # smaller than the real character:
-    #   - trailing (right) edge: the body has moved away, so misclassified
-    #     character pixels are left exposed, sitting on what should now be
-    #     background. Visibly wrong, and only covered if the mask grows.
-    #   - leading (left) edge: the body's own displacement moves over that
-    #     area, so misclassified pixels there get covered anyway. The
-    #     error self-heals, and growing only makes the character smear
-    #     further over the background - with no hole there to repaint it,
-    #     that smear IS the "aura".
-    #   - vertically: the warp never moves anything vertically, so growth
-    #     up/down can only smear the character over background that
-    #     nothing will repaint. Pure aura, no benefit - this is what made
-    #     hair strands come out with a fat halo on both sides.
-    # Observed on real footage exactly this way: without expansion the
-    # left side of a head was clean but the right side stopped short;
-    # with symmetric expansion the right side was fixed but the left
-    # gained an aura.
-    #
-    # (0, 0) is in the offset set deliberately. Taking the max over
-    # NEIGHBOURS ONLY translates a region rather than growing it - the
-    # same self-exclusion quirk that makes this operator slide a ramp
+    # (0, 0) must be in the set. Taking the max over NEIGHBOURS ONLY
+    # translates a region rather than growing it (verified: a one-sided
+    # neighbour set slides the block sideways, eroding the trailing edge),
+    # the same self-exclusion quirk that makes this operator slide a ramp
     # sideways instead of narrowing it. Including the pixel itself makes
-    # this a genuine one-sided dilation, so the left edge stays put.
-    offsets = [(0, 0), (0, -1)]
-
+    # it a genuine dilation.
     current = depth_t
     for _ in range(n_iters):
         neighbors = torch.stack([shift(current, dy, dx) for dy, dx in offsets], dim=0)
@@ -161,6 +138,29 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         is_bg = current <= threshold
         current = torch.where(is_bg, neighbor_min_confirmed, neighbor_max)
     return current
+
+
+# Grow the foreground RIGHTWARD (a background pixel takes the value of the
+# neighbour to its LEFT). The warp is `flow = -disp` (see
+# _forward_legacy_cuda_splat), so higher disparity shifts LEFT and the
+# disocclusion only ever opens on an object's RIGHT. That is where the
+# depth region being slightly too small leaves misclassified character
+# pixels exposed on what should now be background, so that is where growth
+# actually buys something.
+EXPAND_RIGHT = [(0, 0), (0, -1)]
+
+# Grow LEFT/UP/DOWN. Distinct knob because these are a TRADE, not a fix:
+#   - left: the body's own displacement usually moves over that area
+#     anyway, so the error self-heals; growing just smears the character
+#     further over background, and with no hole there to repaint it, that
+#     smear IS the "aura".
+#   - up/down: the warp never moves anything vertically, so a
+#     misclassified character pixel above/below the silhouette is never
+#     covered by the body and stays as an un-shifted fringe. Growing does
+#     make it shift with the character - but it then lands ~max_disp to
+#     the LEFT, as a smear. It relocates the artifact rather than
+#     removing it, so tune by eye rather than assuming more is better.
+EXPAND_OTHER = [(0, 0), (0, 1), (1, 0), (-1, 0)]
 
 
 def _position_preserving_sharpen(depth_t, radius, gain, min_contrast=0.0):
@@ -619,6 +619,7 @@ class DepthCrafterDemo:
         sharpen_radius: int = 6,
         sharpen_gain: float = 3.0,
         sharpen_min_contrast_frac: float = 0.15,
+        edge_fill_iters_other: int = 0,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's LOW-RES depth before upsampling - an
@@ -777,6 +778,7 @@ class DepthCrafterDemo:
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
             "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
+            "edge_fill_iters_other": edge_fill_iters_other,
         }
 
         output_start = 0
@@ -1049,7 +1051,8 @@ class DepthCrafterDemo:
                         f"sharpen_mode must be 'none' or 'stretch', got {sharpen_mode!r}"
                     )
                 print(
-                    f"    low-res expand: {edge_fill_iters} iter(s)"
+                    f"    expand (full-res): right={edge_fill_iters}"
+                    f" other={edge_fill_iters_other}"
                     f" (threshold_frac={edge_threshold_frac})"
                 )
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
@@ -1072,28 +1075,6 @@ class DepthCrafterDemo:
                 result_batches = []
                 for i in range(0, result.shape[0], decode_chunk_size):
                     batch_gpu = torch.from_numpy(result[i : i + decode_chunk_size]).unsqueeze(1).float().cuda()
-                    # Optional EXPANSION pass, on the low-res depth before
-                    # upsampling. Separate job from the sharpening below,
-                    # and the sharpeners cannot do it: the depth-derived
-                    # foreground region is often slightly SMALLER than the
-                    # real character (the low-res grid can't resolve the
-                    # true silhouette), so the disocclusion hole stops
-                    # short and leaves a sliver of character that was
-                    # warped by BACKGROUND disparity - i.e. character
-                    # pixels rendered in the wrong place. Those have to be
-                    # repainted, which means the mask has to cover them,
-                    # which means growing the foreground classification.
-                    # _edge_threshold_fill is a ~1px-per-iteration dilation
-                    # (see _position_preserving_sharpen's docstring for the
-                    # measurement), and run here each iteration is one
-                    # LOW-RES pixel, i.e. ~upsample-ratio full-res pixels -
-                    # the right granularity for covering a low-res/full-res
-                    # mismatch. This is EDGE_FILL_ITERS in its original
-                    # pre-reorder position and meaning.
-                    if edge_fill_iters > 0:
-                        batch_gpu = _edge_threshold_fill(
-                            batch_gpu, edge_threshold, edge_fill_iters
-                        )
                     batch_upsampled = F.interpolate(
                         batch_gpu,
                         size=(original_height, original_width),
@@ -1107,6 +1088,23 @@ class DepthCrafterDemo:
                         )
                     else:
                         batch_filled = batch_upsampled
+
+                    # EXPANSION, at FULL res so one iteration is one
+                    # FULL-RES pixel. It used to run on the low-res depth,
+                    # where the smallest possible step was one low-res
+                    # pixel (~2.5 full-res px at max_res=768 on 1080p) -
+                    # too coarse to ask for the 1px of growth that the
+                    # leftover strays actually need. Runs after the
+                    # sharpen, so a hard edge goes in and a hard edge
+                    # comes out, just moved.
+                    if edge_fill_iters > 0:
+                        batch_filled = _edge_threshold_fill(
+                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_RIGHT
+                        )
+                    if edge_fill_iters_other > 0:
+                        batch_filled = _edge_threshold_fill(
+                            batch_filled, edge_threshold, edge_fill_iters_other, EXPAND_OTHER
+                        )
                     batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
                     # same audit - a full-chunk np.isfinite(result) boolean
@@ -1847,6 +1845,7 @@ def main(
     sharpen_radius: int = 6,
     sharpen_gain: float = 3.0,
     sharpen_min_contrast_frac: float = 0.15,
+    edge_fill_iters_other: int = 0,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1920,6 +1919,7 @@ def main(
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
         "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
+        "edge_fill_iters_other": edge_fill_iters_other,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1964,6 +1964,7 @@ def main(
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,
         sharpen_min_contrast_frac=sharpen_min_contrast_frac,
+        edge_fill_iters_other=edge_fill_iters_other,
     )
 
     if depth_only:

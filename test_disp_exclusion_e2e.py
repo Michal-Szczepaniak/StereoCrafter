@@ -40,7 +40,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from depth_splatting_inference import DepthSplatting, _edge_threshold_fill
+from depth_splatting_inference import (
+    DepthSplatting, _edge_threshold_fill, EXPAND_RIGHT, EXPAND_OTHER,
+)
 from splat_store import ffv1_encode, open_store, DEPTH_QUANT_LEVELS
 import inpainting_inference
 from inpainting_inference import _disp_exclusion_mask
@@ -101,6 +103,7 @@ OUT_ROOT = "outputs/synthetic_disp_e2e"
 MAX_RES = 768
 EDGE_THRESHOLD_FRAC = 0.10
 EDGE_FILL_ITERS = 3
+EDGE_FILL_ITERS_OTHER = 0
 
 # Guided-filter refinement (prototype). Tested on real footage and judged
 # not worth its complexity - it can't distinguish a real depth boundary
@@ -310,11 +313,11 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
     low-res-pixel step the way nearest does; (3) the softened edge is
     re-hardened, by whichever of the two operators `mode` selects.
 
-    EDGE_FILL_ITERS runs _edge_threshold_fill on the LOW-RES depth first
-    (an expansion pass - grows the foreground so it still covers the real
-    silhouette after upsampling), then mode selects the full-res step:
-    mode="stretch" (_position_preserving_sharpen) re-hardens WITHOUT
-    moving the boundary; mode="none" leaves the upsampled depth alone.
+    mode selects the full-res re-hardening step: mode="stretch"
+    (_position_preserving_sharpen) re-hardens WITHOUT moving the boundary;
+    mode="none" leaves the upsampled depth alone. The directional
+    expansion passes then run at full res, matching production - see
+    EXPAND_RIGHT/EXPAND_OTHER.
 
     This test hand-authors a depth map directly (no real DepthCrafter
     inference), so without the resolution round-trip here, the synthetic
@@ -331,11 +334,9 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
     low_res = cv2.resize(depthnorm_full, (low_w, low_h), interpolation=cv2.INTER_AREA)
 
     low_res_t = torch.from_numpy(low_res).unsqueeze(0).unsqueeze(0).float().cuda()
-    if EDGE_FILL_ITERS > 0:
-        threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
-            float(low_res.max()) - float(low_res.min())
-        )
-        low_res_t = _edge_threshold_fill(low_res_t, threshold, EDGE_FILL_ITERS)
+    threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
+        float(low_res.max()) - float(low_res.min())
+    )
     upsampled_t = F.interpolate(low_res_t, size=(H, W), mode="bilinear", align_corners=False)
 
     if mode == "stretch":
@@ -343,14 +344,22 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
         min_contrast = SHARPEN_MIN_CONTRAST_FRAC * (
             float(low_res.max()) - float(low_res.min())
         )
-        return _position_preserving_sharpen(
+        out = _position_preserving_sharpen(
             upsampled, SHARPEN_RADIUS, SHARPEN_GAIN, min_contrast
         )
+    elif mode == "none":
+        out = upsampled_t[0, 0].cpu().numpy()
+    else:
+        raise ValueError(f"unknown sharpen mode {mode!r} - expected 'stretch' or 'none'")
 
-    if mode == "none":
-        return upsampled_t[0, 0].cpu().numpy()
-
-    raise ValueError(f"unknown sharpen mode {mode!r} - expected 'stretch' or 'none'")
+    # Directional expansion at full res, after the sharpen - matches
+    # production's order and units (one iteration = one full-res pixel).
+    out_t = torch.from_numpy(out).unsqueeze(0).unsqueeze(0).float().cuda()
+    if EDGE_FILL_ITERS > 0:
+        out_t = _edge_threshold_fill(out_t, threshold, EDGE_FILL_ITERS, EXPAND_RIGHT)
+    if EDGE_FILL_ITERS_OTHER > 0:
+        out_t = _edge_threshold_fill(out_t, threshold, EDGE_FILL_ITERS_OTHER, EXPAND_OTHER)
+    return out_t[0, 0].cpu().numpy()
 
 
 def _apply_guided_refinement(depthnorm_full: np.ndarray, guide_bgr: np.ndarray) -> np.ndarray:
