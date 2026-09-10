@@ -636,7 +636,18 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
             timesteps = timesteps[t_start:]
             sigma_start = self.scheduler.sigmas[t_start].to(device=device, dtype=latents.dtype)
 
-            init_latents = frame_latents
+            # BUGFIX: frame_latents is the RAW VAE latent (_encode_vae_frames
+            # never applies scaling_factor - SVD deliberately concatenates the
+            # conditioning image unscaled), but the denoising loop runs in
+            # SCALED latent space: decode_latents() divides by scaling_factor
+            # on the way out, so `latents` here are raw*scaling_factor.
+            # Seeding img2img from the unscaled tensor therefore injected an
+            # init image 1/0.18215 = 5.49x too large - measured on a real
+            # frame from this repo's own store: raw latent std 4.458 vs 0.812
+            # for the space it was being mixed into. Every denoise_strength
+            # below 1.0 was starting from an out-of-range image, which is why
+            # the knob has never been usable.
+            init_latents = frame_latents * self.vae.config.scaling_factor
             if self.do_classifier_free_guidance:
                 # frame_latents is [uncond; cond] batch-concatenated - only
                 # the conditional half is a valid starting image.
