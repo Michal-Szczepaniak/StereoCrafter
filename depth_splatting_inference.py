@@ -75,8 +75,8 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
     each pixel's CURRENT (just-updated) value - not a one-time
     classification:
       - a pixel currently <= threshold takes the MIN of its attached
-        neighbors (see the alternating 8/4-connected neighbourhood in the
-        loop below) - but only neighbors that
+        neighbors (see the directional neighbourhood in the loop below,
+        which is deliberately one-sided) - but only neighbors that
         are THEMSELVES currently above threshold count as candidates.
         Excluding same-side neighbors is required: without it, two
         adjacent below-threshold pixels just keep copying each other's low
@@ -113,32 +113,40 @@ def _edge_threshold_fill(depth_t, threshold, n_iters):
         y0, x0 = max(dy, 0), max(dx, 0)
         return p[:, :, y0:y0 + h, x0:x0 + w]
 
-    current = depth_t
-    for it in range(n_iters):
-        # Alternate an 8-connected (square) pass with a 4-connected
-        # (diamond) one, SQUARE FIRST. Each shape on its own is badly
-        # anisotropic - measured growth in radius on a disc, worst
-        # direction vs best:
-        #     iters=1  diamond  0.25px .. 1.50px   (6.0x)
-        #     iters=1  square   0.75px .. 2.25px   (3.0x)
-        #     iters=2  diamond  1.00px .. 2.75px   (2.75x)
-        #     iters=2  square   1.75px .. 3.50px   (2.00x)
-        #     iters=2  alternating                 (1.57x)
-        #     iters=3  alternating                 (1.50x)
-        # Worst-direction growth is what matters here, since the mask
-        # fails wherever it grew least, and a curved silhouette sweeps
-        # through every direction. A 4-neighbour pass cannot grow a pixel
-        # that touches the foreground only at a CORNER, which is most of a
-        # round edge - hence the 0.25px worst case that let a mask stop
-        # just short of a character's head. Alternating approximates an
-        # octagon, far closer to a disc than either shape alone, and
-        # starting with the square gets the better worst case at
-        # n_iters=1 too (dilation composes order-independently, so it
-        # costs nothing at higher counts).
-        offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        if it % 2 == 0:
-            offsets += [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+    # DIRECTIONAL, not isotropic: grow the foreground ONLY to the right,
+    # and not at all vertically.
+    #
+    # The warp is `flow = -disp` (see _forward_legacy_cuda_splat), so
+    # higher disparity shifts LEFT: an object moves left and the
+    # disocclusion opens on its RIGHT. That makes the two sides behave
+    # completely differently when the depth-derived region is slightly
+    # smaller than the real character:
+    #   - trailing (right) edge: the body has moved away, so misclassified
+    #     character pixels are left exposed, sitting on what should now be
+    #     background. Visibly wrong, and only covered if the mask grows.
+    #   - leading (left) edge: the body's own displacement moves over that
+    #     area, so misclassified pixels there get covered anyway. The
+    #     error self-heals, and growing only makes the character smear
+    #     further over the background - with no hole there to repaint it,
+    #     that smear IS the "aura".
+    #   - vertically: the warp never moves anything vertically, so growth
+    #     up/down can only smear the character over background that
+    #     nothing will repaint. Pure aura, no benefit - this is what made
+    #     hair strands come out with a fat halo on both sides.
+    # Observed on real footage exactly this way: without expansion the
+    # left side of a head was clean but the right side stopped short;
+    # with symmetric expansion the right side was fixed but the left
+    # gained an aura.
+    #
+    # (0, 0) is in the offset set deliberately. Taking the max over
+    # NEIGHBOURS ONLY translates a region rather than growing it - the
+    # same self-exclusion quirk that makes this operator slide a ramp
+    # sideways instead of narrowing it. Including the pixel itself makes
+    # this a genuine one-sided dilation, so the left edge stays put.
+    offsets = [(0, 0), (0, -1)]
 
+    current = depth_t
+    for _ in range(n_iters):
         neighbors = torch.stack([shift(current, dy, dx) for dy, dx in offsets], dim=0)
         neighbor_is_bg = neighbors <= threshold
 

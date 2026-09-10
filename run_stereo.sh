@@ -108,10 +108,13 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 # resolve the true silhouette), which leaves the disocclusion hole
 # stopping short and a sliver of character warped by BACKGROUND disparity
 # - character pixels in the wrong place, which have to be repainted, so
-# the mask has to cover them. Measured to be a ~1px-per-iteration
-# dilation, so one iteration = one LOW-RES pixel (~2.5 full-res px at
-# MAX_RES=768 on 1080p). Costs a halo, so use the smallest value that
-# actually covers the mismatch. It does NOT sharpen - the ramp width is
+# the mask has to cover them. DIRECTIONAL: grows only to the RIGHT, and
+# not at all vertically, because the warp shifts left (flow = -disp) so
+# the disocclusion only ever opens on an object's right. Growing the
+# other way just smears the character over background that nothing will
+# repaint - which is the "aura". One iteration = one LOW-RES pixel
+# (~2.5 full-res px at MAX_RES=768 on 1080p). It does NOT sharpen - the
+# ramp width is
 # unchanged at every iteration count, so it has no effect on splat
 # tearing; see SHARPEN_MODE for that. Content-dependent, re-tune per
 # episode. 0 = off.
