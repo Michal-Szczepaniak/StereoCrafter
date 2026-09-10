@@ -614,12 +614,11 @@ class DepthCrafterDemo:
         resume: bool = True,
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
-        edge_fill_iters: int = 3,
+        edge_fill_iters: int = 2,
         sharpen_mode: str = "none",
         sharpen_radius: int = 6,
         sharpen_gain: float = 3.0,
         sharpen_min_contrast_frac: float = 0.15,
-        edge_fill_iters_other: int = 0,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's LOW-RES depth before upsampling - an
@@ -778,7 +777,6 @@ class DepthCrafterDemo:
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
             "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
-            "edge_fill_iters_other": edge_fill_iters_other,
         }
 
         output_start = 0
@@ -1051,8 +1049,7 @@ class DepthCrafterDemo:
                         f"sharpen_mode must be 'none' or 'stretch', got {sharpen_mode!r}"
                     )
                 print(
-                    f"    expand (full-res): right={edge_fill_iters}"
-                    f" other={edge_fill_iters_other}"
+                    f"    expand (full-res): {edge_fill_iters}px each way"
                     f" (threshold_frac={edge_threshold_frac})"
                 )
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
@@ -1097,13 +1094,18 @@ class DepthCrafterDemo:
                     # leftover strays actually need. Runs after the
                     # sharpen, so a hard edge goes in and a hard edge
                     # comes out, just moved.
+                    # Both directions at the same count. They are kept as
+                    # separate passes because they are separate trades
+                    # (see EXPAND_RIGHT/EXPAND_OTHER) - tuning on real
+                    # footage just landed both at the same value, so they
+                    # share one knob. Splitting them again is a one-line
+                    # change if some scene ever needs them to differ.
                     if edge_fill_iters > 0:
                         batch_filled = _edge_threshold_fill(
                             batch_filled, edge_threshold, edge_fill_iters, EXPAND_RIGHT
                         )
-                    if edge_fill_iters_other > 0:
                         batch_filled = _edge_threshold_fill(
-                            batch_filled, edge_threshold, edge_fill_iters_other, EXPAND_OTHER
+                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_OTHER
                         )
                     batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
@@ -1840,12 +1842,11 @@ def main(
     disp_tolerance: float = 1.0,
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
-    edge_fill_iters: int = 3,
+    edge_fill_iters: int = 2,
     sharpen_mode: str = "none",
     sharpen_radius: int = 6,
     sharpen_gain: float = 3.0,
     sharpen_min_contrast_frac: float = 0.15,
-    edge_fill_iters_other: int = 0,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1919,7 +1920,6 @@ def main(
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
         "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
-        "edge_fill_iters_other": edge_fill_iters_other,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1964,7 +1964,6 @@ def main(
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,
         sharpen_min_contrast_frac=sharpen_min_contrast_frac,
-        edge_fill_iters_other=edge_fill_iters_other,
     )
 
     if depth_only:

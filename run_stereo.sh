@@ -102,30 +102,24 @@ ATTENTION_SLICING="${ATTENTION_SLICING:-True}"
 # original uncompressed format.
 COMPRESS_STORE="${COMPRESS_STORE:-True}"
 # EXPANSION of the foreground classification, at FULL res (one iteration =
-# one full-res pixel). Needed because the depth-derived foreground is often
-# slightly SMALLER than the real character - the low-res depth grid can't
-# resolve the true silhouette - which leaves character pixels misclassified
-# as background, warped with BACKGROUND disparity, i.e. left in the wrong
-# place.
+# one full-res pixel, applied each way). Needed because the depth-derived
+# foreground is often slightly SMALLER than the real character - the
+# low-res depth grid can't resolve the true silhouette - which leaves
+# character pixels misclassified as background, warped with BACKGROUND
+# disparity, i.e. left in the wrong place.
 #
-# Split by DIRECTION, because the two are not the same trade. The warp is
-# flow = -disp, so objects shift LEFT and the disocclusion only ever opens
-# on an object's RIGHT:
-#   EDGE_FILL_ITERS (rightward) is the one that actually fixes something -
-#     that is the side where misclassified pixels sit exposed on what
-#     should now be background, and where growth turns into hole that gets
-#     repainted.
-#   EDGE_FILL_ITERS_OTHER (left/up/down) is a TRADE. Leftward, the body's
-#     own displacement usually covers the error anyway, so growing just
-#     smears the character over background - that smear IS the "aura".
-#     Vertically, the warp never moves anything, so a misclassified pixel
-#     above/below stays as an un-shifted fringe; growing makes it shift
-#     with the character but lands it ~MAX_DISP to the left as a smear. It
-#     relocates the artifact rather than removing it, so tune by eye.
-# Neither sharpens - ramp width is unchanged at every iteration count, so
-# neither affects splat tearing; see SHARPEN_MODE for that.
-EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
-EDGE_FILL_ITERS_OTHER="${EDGE_FILL_ITERS_OTHER:-0}"
+# Internally this is two directional passes, because the directions are
+# different trades (the warp is flow = -disp, so objects shift LEFT and
+# the disocclusion only ever opens on an object's RIGHT):
+#   rightward growth turns into hole that gets repainted - it fixes the
+#     side where misclassified pixels sit exposed on background.
+#   left/up/down growth smears the character over background that nothing
+#     repaints - that smear is the "aura" - but it does clean up the
+#     un-shifted 1px fringe left above/below a silhouette.
+# Tuning on real footage landed both at the same value, so they share one
+# knob. It does NOT sharpen - ramp width is unchanged at every iteration
+# count, so it has no effect on splat tearing; see SHARPEN_MODE for that.
+EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-2}"
 # Which depth values count as foreground for the expansion above, as a
 # fraction of the chunk's own depth range. Only pixels above this take the
 # grow-outward branch.
@@ -292,7 +286,6 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
-        --edge_fill_iters_other="$EDGE_FILL_ITERS_OTHER" \
         --sharpen_mode="$SHARPEN_MODE" \
         --sharpen_radius="$SHARPEN_RADIUS" \
         --sharpen_gain="$SHARPEN_GAIN" \

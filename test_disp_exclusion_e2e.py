@@ -102,8 +102,7 @@ OUT_ROOT = "outputs/synthetic_disp_e2e"
 # values, not placeholders.
 MAX_RES = 768
 EDGE_THRESHOLD_FRAC = 0.10
-EDGE_FILL_ITERS = 3
-EDGE_FILL_ITERS_OTHER = 0
+EDGE_FILL_ITERS = 2
 
 # Guided-filter refinement (prototype). Tested on real footage and judged
 # not worth its complexity - it can't distinguish a real depth boundary
@@ -114,11 +113,11 @@ GUIDED_FILTER_ENABLED = False
 GUIDED_FILTER_RADIUS = 8
 GUIDED_FILTER_EPS = 1e-3
 
-# Matches production: EDGE_FILL_ITERS is a LOW-RES expansion pass before
-# upsampling, and SHARPEN_MODE is the optional full-res re-hardening after
-# it. "stretch" = _position_preserving_sharpen, "none" = leave it alone.
-# main() splats BOTH and dumps a mask for each, so they can be A/B'd in
-# one run.
+# Matches production's order: bilinear upsample, then SHARPEN_MODE's
+# optional full-res re-hardening ("stretch" = _position_preserving_sharpen,
+# "none" = leave it alone), then EDGE_FILL_ITERS' directional expansion,
+# also at full res. main() splats BOTH sharpen modes and dumps a mask for
+# each, so they can be A/B'd in one run.
 SHARPEN_MODE = "stretch"
 # Window must reach the flat plateau on BOTH sides of the transition: the
 # ramp is ~(1-2 low-res px) x (upsample ratio) ~= 2.5-6 full-res px here,
@@ -357,8 +356,7 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
     out_t = torch.from_numpy(out).unsqueeze(0).unsqueeze(0).float().cuda()
     if EDGE_FILL_ITERS > 0:
         out_t = _edge_threshold_fill(out_t, threshold, EDGE_FILL_ITERS, EXPAND_RIGHT)
-    if EDGE_FILL_ITERS_OTHER > 0:
-        out_t = _edge_threshold_fill(out_t, threshold, EDGE_FILL_ITERS_OTHER, EXPAND_OTHER)
+        out_t = _edge_threshold_fill(out_t, threshold, EDGE_FILL_ITERS, EXPAND_OTHER)
     return out_t[0, 0].cpu().numpy()
 
 
