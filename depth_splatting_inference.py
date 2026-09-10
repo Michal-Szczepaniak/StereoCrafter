@@ -579,20 +579,21 @@ class DepthCrafterDemo:
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
         edge_fill_iters: int = 3,
-        sharpen_mode: str = "edge_fill",
+        sharpen_mode: str = "none",
         sharpen_radius: int = 6,
         sharpen_gain: float = 3.0,
         sharpen_min_contrast_frac: float = 0.15,
-        lowres_edge_fill_iters: int = 0,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
-        applied to each chunk's depth AFTER it's bilinear-upsampled to full
-        resolution (see that function's own docstring for the full
-        mechanism/rationale, and why upsample-then-fill replaced the older
-        fill-then-upsample order). Old validation (frac=0.10, iters=3,
-        max_res=768) was measured under that older order and is not
-        directly comparable now that edge_fill_iters' reach is in full-res
-        pixels instead of low-res ones - re-verify before trusting as-is.
+        applied to each chunk's LOW-RES depth before upsampling - an
+        EXPANSION pass, growing the foreground classification so it still
+        covers the real silhouette after upsampling. Measured to be a
+        ~1px-per-iteration dilation, so one iteration here is one low-res
+        pixel (~2.5 full-res px at max_res=768 on 1080p). It does NOT
+        sharpen: the ramp width is unchanged at every iteration count, so
+        it has no effect on splat tearing - see sharpen_mode for that.
+        Validated defaults 0.10/3 at max_res=768; content-dependent, so
+        re-tune per episode.
 
         window_size/window_overlap control DepthCrafter's OWN internal
         sliding-window inference within a single self.pipe() call - these
@@ -740,7 +741,6 @@ class DepthCrafterDemo:
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
             "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
-            "lowres_edge_fill_iters": lowres_edge_fill_iters,
         }
 
         output_start = 0
@@ -973,18 +973,21 @@ class DepthCrafterDemo:
                 # old low-res-grid version did at the validated iters=3.
                 #
                 # WHICH re-hardening operator runs is sharpen_mode:
-                #   "edge_fill"  - _edge_threshold_fill, the long-standing
-                #     behavior. Measured (see _position_preserving_sharpen's
-                #     docstring) to act as a ~1px-per-iteration DILATION of
-                #     the foreground rather than a sharpener, because its
-                #     threshold is global: when both sides of a boundary sit
-                #     above it (85% of the frame did, on the test scene),
-                #     both take the max-of-neighbors branch and the brighter
-                #     side simply grows. That is the "aura/halo around
-                #     characters" this pipeline has always had.
+                #   "none"    - leave the upsampled depth as it is.
                 #   "stretch" - _position_preserving_sharpen, which hardens
-                #     about the LOCAL plateau midpoint instead, leaving the
-                #     boundary's sub-pixel position untouched.
+                #     about the LOCAL plateau midpoint, leaving the
+                #     boundary's sub-pixel position untouched. This is the
+                #     only one of the two that affects splat tearing.
+                #
+                # _edge_threshold_fill is deliberately NOT an option here:
+                # measured, its gap structure is identical to doing nothing
+                # at every iteration count, because max/min-of-neighbours
+                # propagation TRANSLATES a ramp rather than narrowing it
+                # (the neighbour one pixel away is not the plateau, it is
+                # the next ramp value). Its only real effect is dilation,
+                # which is a genuinely useful but different job, and it now
+                # runs where that job belongs - on the low-res depth,
+                # before upsampling, driven by edge_fill_iters.
                 #
                 # edge_threshold only needs a global min/max, computed
                 # straight from the raw low-res numpy array before any GPU
@@ -1005,12 +1008,14 @@ class DepthCrafterDemo:
                 sharpen_min_contrast = sharpen_min_contrast_frac * (
                     float(result.max()) - float(result.min())
                 )
-                if sharpen_mode not in ("edge_fill", "stretch"):
+                if sharpen_mode not in ("none", "stretch"):
                     raise ValueError(
-                        f"sharpen_mode must be 'edge_fill' or 'stretch', got {sharpen_mode!r}"
+                        f"sharpen_mode must be 'none' or 'stretch', got {sharpen_mode!r}"
                     )
-                if lowres_edge_fill_iters > 0:
-                    print(f"    low-res expand: {lowres_edge_fill_iters} iter(s)")
+                print(
+                    f"    low-res expand: {edge_fill_iters} iter(s)"
+                    f" (threshold_frac={edge_threshold_frac})"
+                )
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
                 if sharpen_mode == "stretch":
                     print(
@@ -1018,7 +1023,7 @@ class DepthCrafterDemo:
                         f", min_contrast_frac={sharpen_min_contrast_frac}"
                     )
                 else:
-                    print(f", threshold_frac={edge_threshold_frac}, iters={edge_fill_iters}")
+                    print()
                 # Bounded by decode_chunk_size (not the whole chunk at once)
                 # to avoid the OOM bug class found/fixed elsewhere in this
                 # file - upsample and edge-fill are both pure per-frame
@@ -1047,11 +1052,11 @@ class DepthCrafterDemo:
                     # measurement), and run here each iteration is one
                     # LOW-RES pixel, i.e. ~upsample-ratio full-res pixels -
                     # the right granularity for covering a low-res/full-res
-                    # mismatch. This is the original pre-reorder position
-                    # for this pass, restored deliberately.
-                    if lowres_edge_fill_iters > 0:
+                    # mismatch. This is EDGE_FILL_ITERS in its original
+                    # pre-reorder position and meaning.
+                    if edge_fill_iters > 0:
                         batch_gpu = _edge_threshold_fill(
-                            batch_gpu, edge_threshold, lowres_edge_fill_iters
+                            batch_gpu, edge_threshold, edge_fill_iters
                         )
                     batch_upsampled = F.interpolate(
                         batch_gpu,
@@ -1065,9 +1070,7 @@ class DepthCrafterDemo:
                             min_contrast=sharpen_min_contrast,
                         )
                     else:
-                        batch_filled = _edge_threshold_fill(
-                            batch_upsampled, edge_threshold, edge_fill_iters
-                        )
+                        batch_filled = batch_upsampled
                     batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
                     # same audit - a full-chunk np.isfinite(result) boolean
@@ -1804,11 +1807,10 @@ def main(
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 3,
-    sharpen_mode: str = "edge_fill",
+    sharpen_mode: str = "none",
     sharpen_radius: int = 6,
     sharpen_gain: float = 3.0,
     sharpen_min_contrast_frac: float = 0.15,
-    lowres_edge_fill_iters: int = 0,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1829,13 +1831,10 @@ def main(
 
     sharpen_mode: which operator re-hardens the depth edge after the
     bilinear upsample to full res.
-      "edge_fill" (default, long-standing behavior): _edge_threshold_fill,
-        tuned by edge_threshold_frac/edge_fill_iters. Measured to behave
-        as a ~1px-per-iteration DILATION of the foreground rather than a
-        sharpener, because its threshold is global - that is the source of
-        the "aura/halo around characters" this pipeline has always had.
-        Content-dependent; re-tune per episode rather than assuming the
-        old defaults (0.10, 3) transfer.
+      "none" (default): leave the upsampled depth alone. Combined with
+        edge_fill_iters' low-res expansion pass, this is the pipeline's
+        original behavior (modulo the upsample now being bilinear rather
+        than nearest).
       "stretch": _position_preserving_sharpen, tuned by sharpen_radius/
         sharpen_gain. Hardens about the LOCAL plateau midpoint, leaving
         the boundary's sub-pixel position where it was. Measured 2.4-4.6x
@@ -1885,7 +1884,6 @@ def main(
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
         "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
-        "lowres_edge_fill_iters": lowres_edge_fill_iters,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1930,7 +1928,6 @@ def main(
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,
         sharpen_min_contrast_frac=sharpen_min_contrast_frac,
-        lowres_edge_fill_iters=lowres_edge_fill_iters,
     )
 
     if depth_only:

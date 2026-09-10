@@ -101,27 +101,35 @@ ATTENTION_SLICING="${ATTENTION_SLICING:-True}"
 # to stage 2's per-iteration diffusion cost. Set False to fall back to the
 # original uncompressed format.
 COMPRESS_STORE="${COMPRESS_STORE:-True}"
-# Silhouette comb/notch artifact fix (see _edge_threshold_fill's docstring
-# in depth_splatting_inference.py for the full mechanism) - reverses the
-# depth model's own soft-edge output before upsampling. Validated at these
-# defaults on real footage at MAX_RES=768 specifically - likely needs
-# re-tuning per anime episode (different silhouette contrast/detail) and
-# re-verifying at other MAX_RES values.
+# EXPANSION pass on the LOW-RES depth, before upsampling: grows the
+# foreground classification so it still covers the real silhouette after
+# upsampling to full res. Needed because the depth-derived foreground is
+# often slightly SMALLER than the real character (the low-res grid can't
+# resolve the true silhouette), which leaves the disocclusion hole
+# stopping short and a sliver of character warped by BACKGROUND disparity
+# - character pixels in the wrong place, which have to be repainted, so
+# the mask has to cover them. Measured to be a ~1px-per-iteration
+# dilation, so one iteration = one LOW-RES pixel (~2.5 full-res px at
+# MAX_RES=768 on 1080p). Costs a halo, so use the smallest value that
+# actually covers the mismatch. It does NOT sharpen - the ramp width is
+# unchanged at every iteration count, so it has no effect on splat
+# tearing; see SHARPEN_MODE for that. Content-dependent, re-tune per
+# episode. 0 = off.
 EDGE_THRESHOLD_FRAC="${EDGE_THRESHOLD_FRAC:-0.10}"
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-3}"
 
-# Which operator re-hardens the depth edge after upsampling to full res.
-# "edge_fill" (default) = the long-standing _edge_threshold_fill, tuned by
-# EDGE_THRESHOLD_FRAC/EDGE_FILL_ITERS above. "stretch" =
-# _position_preserving_sharpen, which hardens about the LOCAL plateau
-# midpoint so the boundary's sub-pixel position is left where it is -
-# measured 2.4-4.6x lower boundary-position error and a smaller halo,
-# with knobs that barely need tuning (see the function's docstring in
-# depth_splatting_inference.py). SHARPEN_RADIUS/SHARPEN_GAIN only apply
-# to "stretch"; radius just needs to be >= the ramp width (insensitive
-# past that), gain=3 sharpens at zero positional cost while higher values
-# harden more but add row-to-row jitter.
-SHARPEN_MODE="${SHARPEN_MODE:-edge_fill}"
+# Optional re-hardening of the depth edge AFTER upsampling to full res.
+# "none" (default) leaves it alone - that plus EDGE_FILL_ITERS above is
+# the pipeline's original behavior (modulo bilinear vs nearest upsample).
+# "stretch" = _position_preserving_sharpen: hardens about the LOCAL
+# plateau midpoint, so the boundary's sub-pixel position is left where it
+# is. This is the only knob that affects splat TEARING (the shredded
+# 1px-on/1px-off holes along silhouettes) - it drives the number of
+# intermediate disparity levels toward zero, and tearing is one gap per
+# level. SHARPEN_* only apply to "stretch": radius just needs to be >= the
+# ramp width (insensitive past that); gain=3 sharpens at zero positional
+# cost, while a very high gain is what actually collapses the tearing.
+SHARPEN_MODE="${SHARPEN_MODE:-none}"
 SHARPEN_RADIUS="${SHARPEN_RADIUS:-6}"
 SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
 # Contrast gate for "stretch": leave any transition weaker than this
@@ -132,20 +140,6 @@ SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
 # increase in mask area. 0 disables the gate.
 SHARPEN_MIN_CONTRAST_FRAC="${SHARPEN_MIN_CONTRAST_FRAC:-0.15}"
 
-# EXPANSION pass on the LOW-RES depth, before upsampling - a different job
-# from the sharpening above, and the sharpeners can't do it (they preserve
-# or tighten the boundary, deliberately). The depth-derived foreground is
-# often slightly smaller than the real character, so the hole stops short
-# and leaves a sliver of character that got warped by BACKGROUND
-# disparity - character pixels in the wrong place, which have to be
-# repainted, which means the mask must cover them. Each iteration grows
-# the foreground by one LOW-RES pixel (~2.5 full-res px at MAX_RES=768 on
-# 1080p). This is EDGE_FILL_ITERS in its original pre-reorder position.
-# 0 = off. Costs a halo, so use the smallest value that covers the
-# mismatch - and note DISP_BG_SEARCH_PX addresses the related but distinct
-# problem of inpainting SOURCING from correctly-placed character pixels,
-# without growing the hole at all.
-LOWRES_EDGE_FILL_ITERS="${LOWRES_EDGE_FILL_ITERS:-0}"
 
 # EXPERIMENTAL, off by default (radius<=0 skips it entirely - see
 # _guided_filter_batch's docstring in depth_splatting_inference.py). When
@@ -289,7 +283,6 @@ stage1_run() {
         --sharpen_radius="$SHARPEN_RADIUS" \
         --sharpen_gain="$SHARPEN_GAIN" \
         --sharpen_min_contrast_frac="$SHARPEN_MIN_CONTRAST_FRAC" \
-        --lowres_edge_fill_iters="$LOWRES_EDGE_FILL_ITERS" \
         --guided_filter_radius="$GUIDED_FILTER_RADIUS" \
         --guided_filter_eps="$GUIDED_FILTER_EPS" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \

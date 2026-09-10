@@ -111,11 +111,11 @@ GUIDED_FILTER_ENABLED = False
 GUIDED_FILTER_RADIUS = 8
 GUIDED_FILTER_EPS = 1e-3
 
-# Position-preserving sharpening - the alternative to _edge_threshold_fill.
-# "stretch": local contrast stretch about the local FG/BG midpoint, at FULL
-# res (see _position_preserving_sharpen). "edge_fill": the current
-# production behavior (_edge_threshold_fill), kept so the two can be A/B'd
-# in one run - main() splats BOTH and dumps a mask for each.
+# Matches production: EDGE_FILL_ITERS is a LOW-RES expansion pass before
+# upsampling, and SHARPEN_MODE is the optional full-res re-hardening after
+# it. "stretch" = _position_preserving_sharpen, "none" = leave it alone.
+# main() splats BOTH and dumps a mask for each, so they can be A/B'd in
+# one run.
 SHARPEN_MODE = "stretch"
 # Window must reach the flat plateau on BOTH sides of the transition: the
 # ramp is ~(1-2 low-res px) x (upsample ratio) ~= 2.5-6 full-res px here,
@@ -310,11 +310,11 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
     low-res-pixel step the way nearest does; (3) the softened edge is
     re-hardened, by whichever of the two operators `mode` selects.
 
-    mode="stretch" (_position_preserving_sharpen): re-hardens WITHOUT
-      moving the boundary - see that function's docstring.
-    mode="edge_fill" (_edge_threshold_fill): current production behavior,
-      which snaps to the low-res grid and so quantizes the boundary's
-      position. Kept for A/B comparison.
+    EDGE_FILL_ITERS runs _edge_threshold_fill on the LOW-RES depth first
+    (an expansion pass - grows the foreground so it still covers the real
+    silhouette after upsampling), then mode selects the full-res step:
+    mode="stretch" (_position_preserving_sharpen) re-hardens WITHOUT
+    moving the boundary; mode="none" leaves the upsampled depth alone.
 
     This test hand-authors a depth map directly (no real DepthCrafter
     inference), so without the resolution round-trip here, the synthetic
@@ -331,6 +331,11 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
     low_res = cv2.resize(depthnorm_full, (low_w, low_h), interpolation=cv2.INTER_AREA)
 
     low_res_t = torch.from_numpy(low_res).unsqueeze(0).unsqueeze(0).float().cuda()
+    if EDGE_FILL_ITERS > 0:
+        threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
+            float(low_res.max()) - float(low_res.min())
+        )
+        low_res_t = _edge_threshold_fill(low_res_t, threshold, EDGE_FILL_ITERS)
     upsampled_t = F.interpolate(low_res_t, size=(H, W), mode="bilinear", align_corners=False)
 
     if mode == "stretch":
@@ -342,18 +347,10 @@ def _apply_production_depth_pipeline(depthnorm_full: np.ndarray, mode: str = SHA
             upsampled, SHARPEN_RADIUS, SHARPEN_GAIN, min_contrast
         )
 
-    if mode == "edge_fill":
-        # threshold from the low-res range - bilinear upsampling can't
-        # produce values outside the range of the samples it interpolates
-        # between, so the low-res range equals the full-res range too
-        # (matches production).
-        threshold = float(low_res.min()) + EDGE_THRESHOLD_FRAC * (
-            float(low_res.max()) - float(low_res.min())
-        )
-        filled_t = _edge_threshold_fill(upsampled_t, threshold, EDGE_FILL_ITERS)
-        return filled_t[0, 0].cpu().numpy()
+    if mode == "none":
+        return upsampled_t[0, 0].cpu().numpy()
 
-    raise ValueError(f"unknown sharpen mode {mode!r} - expected 'stretch' or 'edge_fill'")
+    raise ValueError(f"unknown sharpen mode {mode!r} - expected 'stretch' or 'none'")
 
 
 def _apply_guided_refinement(depthnorm_full: np.ndarray, guide_bgr: np.ndarray) -> np.ndarray:
@@ -503,7 +500,7 @@ def main():
     # else. Only the mask matters for this comparison (the comb is a
     # stage-1 artifact, fully visible before any inpainting), so this
     # extra run only needs its mask dumped, not a full stage-2 pass.
-    ab_mode = "edge_fill" if SHARPEN_MODE == "stretch" else "stretch"
+    ab_mode = "none" if SHARPEN_MODE == "stretch" else "stretch"
     splat_ab = run_splat(f"with_circle_{ab_mode}", with_circle=True, mode=ab_mode)
     _warp_ab, mask_ab, _disp_ab, _meta_ab = open_store(splat_ab, mode="r")
     cv2.imwrite(
