@@ -204,6 +204,43 @@ def _downscale_np(arr: np.ndarray, height: int, width: int) -> np.ndarray:
     return out
 
 
+def _downscale_mask_np(mask_np: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Downsample a binary hole mask by MAX, not area-average.
+
+    _downscale_np's INTER_AREA is right for the warp (it's a real image) and
+    badly wrong for the mask: averaging a 2px hole down to 1px lands it at
+    ~50% coverage (127/255), which sits just under the pipeline's own
+    do_binarize cutoff at 0.5 and is then dropped entirely. Measured on real
+    footage at work_scale=0.5: only 29.5% of hole AREA survived the round
+    trip, and 34% of distinct holes vanished completely - the model was
+    never told they were holes, so it reproduced its conditioning there
+    (black, or the TELEA prefill) instead of inpainting. That is the whole
+    reason work_scale<1.0 looked like "the diffusion model does nothing".
+
+    Same argument the pipeline already makes one stage later, where the
+    latent-resolution downsample is a max_pool2d for exactly this reason
+    (see _encode_mask_frames in pipelines/stereo_video_inpainting.py) - it
+    just never got applied here. Dilating by the downscale factor before a
+    nearest-neighbour subsample IS a max-pool, and costs at most one extra
+    source pixel of hole width; the final composite gates on the FULL
+    resolution mask anyway, so any over-coverage is discarded there rather
+    than reaching the output.
+    """
+    # Kernel radius = half the sampling stride, rounded up, so every
+    # destination sample's full source footprint is covered. Odd sizes only:
+    # cv2.dilate anchors an even kernel off-centre, which dilates in one
+    # direction and still lets holes fall between sample points (measured -
+    # a 2x2 kernel erased MORE holes at work_scale=0.75 than INTER_AREA did).
+    rh = max(int(np.ceil(mask_np.shape[1] / height / 2)), 1)
+    rw = max(int(np.ceil(mask_np.shape[2] / width / 2)), 1)
+    kernel = np.ones((2 * rh + 1, 2 * rw + 1), np.uint8)
+    out = np.empty((mask_np.shape[0], height, width), dtype=mask_np.dtype)
+    for t in range(mask_np.shape[0]):
+        dilated = cv2.dilate(mask_np[t], kernel)
+        out[t] = cv2.resize(dilated, (width, height), interpolation=cv2.INTER_NEAREST)
+    return out
+
+
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     weight_b = (torch.arange(overlap_size).view(1, 1, 1, -1) / overlap_size).to(b.device)
     b[:, :, :, :overlap_size] = (1 - weight_b) * a[:, :, :, -overlap_size:] + weight_b * b[:, :, :, :overlap_size]
@@ -911,7 +948,7 @@ def main(
 
         if work_scale != 1.0:
             warp_small_np = _downscale_np(warp_np, work_height_raw, work_width_raw)
-            mask_small_np = _downscale_np(mask_np, work_height_raw, work_width_raw)
+            mask_small_np = _downscale_mask_np(mask_np, work_height_raw, work_width_raw)
             if prefill_occlusion:
                 warp_small_np = _prefill_occlusion(warp_small_np, mask_small_np)
 
@@ -1224,6 +1261,19 @@ def main(
     print(f"==> Resolution: {width}x{height} (crop the original video the same way before combining)")
     src = meta.get("source_video_path")
     if src:
+        # audio_source_path (set by run_stereo.sh's auto-prepare step when
+        # the source is >1080p, see depth_splatting_inference.py's
+        # DepthSplatting docstring) points at the REAL original file when
+        # `src` above is a video-only proxy prepare_source.sh produced -
+        # decord can't reliably open some UHD remuxes' TrueHD/DTS/PGS
+        # streams at all, so that proxy has none to copy. Falls back to
+        # `src` itself (original one-file-does-both behavior) when absent.
+        audio_src = meta.get("audio_source_path") or src
+        audio_input_arg = ""
+        audio_map_idx = 0
+        if audio_src != src:
+            audio_input_arg = f' -i "{audio_src}"'
+            audio_map_idx = 2
         sbs_out = os.path.join(save_dir, f"{video_name}_sbs.mkv")
         anaglyph_out = os.path.join(save_dir, f"{video_name}_anaglyph.mp4")
         # RIGHT always goes through `setpts=N/({fps}*TB)`, never `fps={fps}`.
@@ -1302,19 +1352,19 @@ def main(
         vaapi_qp = max(encode_crf - 4, 0)
         print("\n==> To combine into side-by-side 3D with ffmpeg (Kodi-compatible, libx264, matches right-eye settings):")
         print(
-            f'    ffmpeg -i "{src}" -i "{right_eye_path}" -filter_complex '
+            f'    ffmpeg -i "{src}" -i "{right_eye_path}"{audio_input_arg} -filter_complex '
             f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
             f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1[v]" '
-            f'-map "[v]" -map 0:a? -map 0:s? '
+            f'-map "[v]" -map {audio_map_idx}:a? -map {audio_map_idx}:s? '
             f'-c:v libx264 -preset {encode_preset} -crf {encode_crf} -c:a copy -c:s copy '
             f'-metadata:s:v:0 stereo_mode=left_right -y "{sbs_out}"'
         )
         print("\n==> Or the same combine offloaded to VAAPI hwaccel (faster, quality not verified - see comment above):")
         print(
-            f'    ffmpeg -vaapi_device /dev/dri/renderD128 -i "{src}" -i "{right_eye_path}" -filter_complex '
+            f'    ffmpeg -vaapi_device /dev/dri/renderD128 -i "{src}" -i "{right_eye_path}"{audio_input_arg} -filter_complex '
             f'"[0:v]{left_time_filter},crop={width}:{height}:0:0[left];'
             f'[1:v]setpts=N/({fps}*TB)[right];[left][right]hstack,setsar=2/1,format=nv12,hwupload[v]" '
-            f'-map "[v]" -map 0:a? -map 0:s? '
+            f'-map "[v]" -map {audio_map_idx}:a? -map {audio_map_idx}:s? '
             f'-c:v h264_vaapi -qp {vaapi_qp} -c:a copy -c:s copy '
             f'-metadata:s:v:0 stereo_mode=left_right -y "{sbs_out}"'
         )
