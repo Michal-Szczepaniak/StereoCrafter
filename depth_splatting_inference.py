@@ -534,12 +534,37 @@ class DepthCrafterDemo:
         decode_chunk_size: int = 8,
         edge_threshold_frac: float = 0.10,
         edge_fill_iters: int = 2,
+        edge_fill_iters_right: int = None,
+        edge_fill_iters_other: int = None,
         sharpen_mode: str = "stretch",
         sharpen_radius: int = 6,
         sharpen_gain: float = 1000.0,
         sharpen_min_contrast_frac: float = 0.15,
     ):
-        """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
+        """edge_fill_iters_right/edge_fill_iters_other: per-direction
+        override of edge_fill_iters (None = use edge_fill_iters for both,
+        the original shared-knob behavior). The two passes were always
+        separate because they are separate trades, not because they wanted
+        the same number - see EXPAND_RIGHT/EXPAND_OTHER above:
+
+          RIGHT is a genuine fix. A disocclusion only ever opens on an
+          object's right (the warp is flow = -disp, so nearer pixels shift
+          LEFT), so that is the one side where a slightly-too-small depth
+          region leaves misclassified character pixels sitting on what is
+          now background AND there is a hole there for stage 2 to repaint.
+          More is defensible here.
+
+          OTHER (left/up/down) relocates artifacts rather than removing
+          them. Growing left smears the character over background with no
+          hole to repaint it - that smear IS the aura. Up/down can never
+          self-heal either, because the warp moves nothing vertically; it
+          just re-lands the fringe ~max_disp to the left. Less is usually
+          better here.
+
+        Tuning on real footage originally landed both at the same value,
+        which is why they shared one knob; asymmetric values are untested.
+
+        edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's LOW-RES depth before upsampling - an
         EXPANSION pass, growing the foreground classification so it still
         covers the real silhouette after upsampling. Measured to be a
@@ -665,6 +690,12 @@ class DepthCrafterDemo:
         manifest_path = os.path.join(checkpoint_dir, "manifest.json")
         latents_path = os.path.join(checkpoint_dir, "carry_latents.pt")
 
+        # Per-direction expansion counts, resolved once. None means "use the
+        # shared edge_fill_iters", which is the original behavior - see this
+        # method's docstring for why the two directions are separate trades.
+        eff_iters_right = edge_fill_iters if edge_fill_iters_right is None else edge_fill_iters_right
+        eff_iters_other = edge_fill_iters if edge_fill_iters_other is None else edge_fill_iters_other
+
         run_params = {
             "input_video_path": os.path.abspath(input_video_path),
             "chunk_size": chunk_size,
@@ -692,6 +723,8 @@ class DepthCrafterDemo:
             # the correct behavior - those really are stale.
             "edge_threshold_frac": edge_threshold_frac,
             "edge_fill_iters": edge_fill_iters,
+            "edge_fill_iters_right": edge_fill_iters_right,
+            "edge_fill_iters_other": edge_fill_iters_other,
             "sharpen_mode": sharpen_mode,
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
@@ -968,7 +1001,8 @@ class DepthCrafterDemo:
                         f"sharpen_mode must be 'none' or 'stretch', got {sharpen_mode!r}"
                     )
                 print(
-                    f"    expand (full-res): {edge_fill_iters}px each way"
+                    f"    expand (full-res): right={eff_iters_right}px"
+                    f" other={eff_iters_other}px"
                     f" (threshold_frac={edge_threshold_frac})"
                 )
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
@@ -1019,12 +1053,13 @@ class DepthCrafterDemo:
                     # footage just landed both at the same value, so they
                     # share one knob. Splitting them again is a one-line
                     # change if some scene ever needs them to differ.
-                    if edge_fill_iters > 0:
+                    if eff_iters_right > 0:
                         batch_filled = _edge_threshold_fill(
-                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_RIGHT
+                            batch_filled, edge_threshold, eff_iters_right, EXPAND_RIGHT
                         )
+                    if eff_iters_other > 0:
                         batch_filled = _edge_threshold_fill(
-                            batch_filled, edge_threshold, edge_fill_iters, EXPAND_OTHER
+                            batch_filled, edge_threshold, eff_iters_other, EXPAND_OTHER
                         )
                     batch_np = batch_filled[:, 0].cpu().numpy()
                     # Checked per-batch (a smaller-magnitude instance of the
@@ -1699,6 +1734,8 @@ def main(
     decode_chunk_size: int = 8,
     edge_threshold_frac: float = 0.10,
     edge_fill_iters: int = 2,
+    edge_fill_iters_right: Optional[int] = None,
+    edge_fill_iters_other: Optional[int] = None,
     sharpen_mode: str = "stretch",
     sharpen_radius: int = 6,
     sharpen_gain: float = 1000.0,
@@ -1719,6 +1756,19 @@ def main(
     chunk boundary exactly like DepthCrafter's own internal window
     transitions. window_overlap MUST be less than window_size - that's the
     model's own internal windowing constraint.
+
+    edge_fill_iters_right/edge_fill_iters_other: split the single
+    edge_fill_iters expansion count per direction (None = both use
+    edge_fill_iters, unchanged). The two passes were always separate
+    because they are separate trades: RIGHT is a genuine fix (a
+    disocclusion only ever opens on an object's right, so that is the one
+    side with both a misclassification AND a hole for stage 2 to repaint),
+    while OTHER (left/up/down) relocates artifacts rather than removing
+    them - growing left smears the character over background with no hole
+    to repaint it, and the warp moves nothing vertically so up/down fringes
+    just re-land to the left. See DepthCrafterDemo.infer's docstring and
+    the EXPAND_RIGHT/EXPAND_OTHER comments. Asymmetric values are
+    UNTESTED - tuning originally landed both at the same number.
 
     sharpen_mode: which operator re-hardens the depth edge after the
     bilinear upsample to full res.
@@ -1781,6 +1831,8 @@ def main(
         "decode_chunk_size": decode_chunk_size,
         "edge_threshold_frac": edge_threshold_frac,
         "edge_fill_iters": edge_fill_iters,
+        "edge_fill_iters_right": edge_fill_iters_right,
+        "edge_fill_iters_other": edge_fill_iters_other,
         "sharpen_mode": sharpen_mode,
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
@@ -1823,6 +1875,8 @@ def main(
         decode_chunk_size=decode_chunk_size,
         edge_threshold_frac=edge_threshold_frac,
         edge_fill_iters=edge_fill_iters,
+        edge_fill_iters_right=edge_fill_iters_right,
+        edge_fill_iters_other=edge_fill_iters_other,
         sharpen_mode=sharpen_mode,
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,

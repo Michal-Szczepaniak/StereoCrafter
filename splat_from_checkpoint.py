@@ -43,6 +43,8 @@ def main(
     keep_depth_chunks: bool = True,
     minutes: float = None,
     audio_source_path: str = None,
+    edge_fill_iters_right: int = None,
+    edge_fill_iters_other: int = None,
 ):
     """device: "cpu" by default (the point of this script) - pass "cuda" to
     run it on a GPU machine too, e.g. to A/B splatting params quickly
@@ -61,6 +63,10 @@ def main(
 
     audio_source_path: see DepthSplatting's own docstring - pass the real
     original file here if input_video_path is a video-only proxy.
+
+    edge_fill_iters_right/edge_fill_iters_other: see
+    depth_splatting_inference.py's main() - per-direction override of the
+    shared edge_fill_iters expansion count (None = both use it).
     """
     manifest_path = os.path.join(checkpoint_dir, "manifest.json")
     with open(manifest_path) as f:
@@ -106,6 +112,8 @@ def main(
         keep_depth_chunks=keep_depth_chunks,
         max_frames=max_frames,
         audio_source_path=audio_source_path,
+        edge_fill_iters_right=edge_fill_iters_right,
+        edge_fill_iters_other=edge_fill_iters_other,
     )
 
 

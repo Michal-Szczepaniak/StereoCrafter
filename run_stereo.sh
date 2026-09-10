@@ -146,6 +146,22 @@ COMPRESS_STORE="${COMPRESS_STORE:-True}"
 # knob. It does NOT sharpen - ramp width is unchanged at every iteration
 # count, so it has no effect on splat tearing; see SHARPEN_MODE for that.
 EDGE_FILL_ITERS="${EDGE_FILL_ITERS:-2}"
+# Per-direction override of EDGE_FILL_ITERS (empty = both directions use it,
+# the original behavior). The two expansion passes are separate TRADES, not
+# one symmetric knob - see depth_splatting_inference.py's EXPAND_RIGHT /
+# EXPAND_OTHER comments:
+#   RIGHT is a genuine fix. A disocclusion only ever opens on an object's
+#   right (warp is flow = -disp, so nearer pixels shift left), so that is
+#   the one side where misclassified character pixels sit on what is now
+#   background AND stage 2 has a hole there to repaint. More is defensible.
+#   OTHER (left/up/down) relocates artifacts rather than removing them.
+#   Growing left smears the character over background with no hole to
+#   repaint it - that smear IS the aura. Up/down can never self-heal, since
+#   the warp moves nothing vertically; it just re-lands the fringe to the
+#   left. Less is usually better.
+# UNTESTED asymmetric - tuning originally landed both at the same value.
+EDGE_FILL_ITERS_RIGHT="${EDGE_FILL_ITERS_RIGHT:-}"
+EDGE_FILL_ITERS_OTHER="${EDGE_FILL_ITERS_OTHER:-}"
 # Which depth values count as foreground for the expansion above, as a
 # fraction of the chunk's own depth range. Only pixels above this take the
 # grow-outward branch.
@@ -295,6 +311,9 @@ run_with_retries() {
 STAGE1_LOG="$OUTPUT_DIR/stage1.log"
 
 stage1_run() {
+    EDGE_DIR_ARGS=()
+    [[ -n "$EDGE_FILL_ITERS_RIGHT" ]] && EDGE_DIR_ARGS+=(--edge_fill_iters_right "$EDGE_FILL_ITERS_RIGHT")
+    [[ -n "$EDGE_FILL_ITERS_OTHER" ]] && EDGE_DIR_ARGS+=(--edge_fill_iters_other "$EDGE_FILL_ITERS_OTHER")
     python -u depth_splatting_inference.py \
         --input_video_path "$WORKING_VIDEO" \
         --output_dir "$SPLAT_DIR" \
@@ -316,6 +335,7 @@ stage1_run() {
         --decode_chunk_size="$STAGE1_DECODE_CHUNK_SIZE" \
         --edge_threshold_frac="$EDGE_THRESHOLD_FRAC" \
         --edge_fill_iters="$EDGE_FILL_ITERS" \
+        "${EDGE_DIR_ARGS[@]}" \
         --sharpen_mode="$SHARPEN_MODE" \
         --sharpen_radius="$SHARPEN_RADIUS" \
         --sharpen_gain="$SHARPEN_GAIN" \
