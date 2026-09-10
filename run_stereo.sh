@@ -132,6 +132,21 @@ SHARPEN_GAIN="${SHARPEN_GAIN:-3.0}"
 # increase in mask area. 0 disables the gate.
 SHARPEN_MIN_CONTRAST_FRAC="${SHARPEN_MIN_CONTRAST_FRAC:-0.15}"
 
+# EXPANSION pass on the LOW-RES depth, before upsampling - a different job
+# from the sharpening above, and the sharpeners can't do it (they preserve
+# or tighten the boundary, deliberately). The depth-derived foreground is
+# often slightly smaller than the real character, so the hole stops short
+# and leaves a sliver of character that got warped by BACKGROUND
+# disparity - character pixels in the wrong place, which have to be
+# repainted, which means the mask must cover them. Each iteration grows
+# the foreground by one LOW-RES pixel (~2.5 full-res px at MAX_RES=768 on
+# 1080p). This is EDGE_FILL_ITERS in its original pre-reorder position.
+# 0 = off. Costs a halo, so use the smallest value that covers the
+# mismatch - and note DISP_BG_SEARCH_PX addresses the related but distinct
+# problem of inpainting SOURCING from correctly-placed character pixels,
+# without growing the hole at all.
+LOWRES_EDGE_FILL_ITERS="${LOWRES_EDGE_FILL_ITERS:-0}"
+
 # EXPERIMENTAL, off by default (radius<=0 skips it entirely - see
 # _guided_filter_batch's docstring in depth_splatting_inference.py). When
 # enabled, refines depth against the actual full-res source RGB frame so
@@ -274,6 +289,7 @@ stage1_run() {
         --sharpen_radius="$SHARPEN_RADIUS" \
         --sharpen_gain="$SHARPEN_GAIN" \
         --sharpen_min_contrast_frac="$SHARPEN_MIN_CONTRAST_FRAC" \
+        --lowres_edge_fill_iters="$LOWRES_EDGE_FILL_ITERS" \
         --guided_filter_radius="$GUIDED_FILTER_RADIUS" \
         --guided_filter_eps="$GUIDED_FILTER_EPS" \
         --keep_depth_chunks="$KEEP_DEPTH_CHUNKS" \

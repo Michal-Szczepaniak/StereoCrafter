@@ -583,6 +583,7 @@ class DepthCrafterDemo:
         sharpen_radius: int = 6,
         sharpen_gain: float = 3.0,
         sharpen_min_contrast_frac: float = 0.15,
+        lowres_edge_fill_iters: int = 0,
     ):
         """edge_threshold_frac/edge_fill_iters control _edge_threshold_fill,
         applied to each chunk's depth AFTER it's bilinear-upsampled to full
@@ -739,6 +740,7 @@ class DepthCrafterDemo:
             "sharpen_radius": sharpen_radius,
             "sharpen_gain": sharpen_gain,
             "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
+            "lowres_edge_fill_iters": lowres_edge_fill_iters,
         }
 
         output_start = 0
@@ -1007,6 +1009,8 @@ class DepthCrafterDemo:
                     raise ValueError(
                         f"sharpen_mode must be 'edge_fill' or 'stretch', got {sharpen_mode!r}"
                     )
+                if lowres_edge_fill_iters > 0:
+                    print(f"    low-res expand: {lowres_edge_fill_iters} iter(s)")
                 print(f"    depth sharpen: mode={sharpen_mode}", end="")
                 if sharpen_mode == "stretch":
                     print(
@@ -1027,6 +1031,28 @@ class DepthCrafterDemo:
                 result_batches = []
                 for i in range(0, result.shape[0], decode_chunk_size):
                     batch_gpu = torch.from_numpy(result[i : i + decode_chunk_size]).unsqueeze(1).float().cuda()
+                    # Optional EXPANSION pass, on the low-res depth before
+                    # upsampling. Separate job from the sharpening below,
+                    # and the sharpeners cannot do it: the depth-derived
+                    # foreground region is often slightly SMALLER than the
+                    # real character (the low-res grid can't resolve the
+                    # true silhouette), so the disocclusion hole stops
+                    # short and leaves a sliver of character that was
+                    # warped by BACKGROUND disparity - i.e. character
+                    # pixels rendered in the wrong place. Those have to be
+                    # repainted, which means the mask has to cover them,
+                    # which means growing the foreground classification.
+                    # _edge_threshold_fill is a ~1px-per-iteration dilation
+                    # (see _position_preserving_sharpen's docstring for the
+                    # measurement), and run here each iteration is one
+                    # LOW-RES pixel, i.e. ~upsample-ratio full-res pixels -
+                    # the right granularity for covering a low-res/full-res
+                    # mismatch. This is the original pre-reorder position
+                    # for this pass, restored deliberately.
+                    if lowres_edge_fill_iters > 0:
+                        batch_gpu = _edge_threshold_fill(
+                            batch_gpu, edge_threshold, lowres_edge_fill_iters
+                        )
                     batch_upsampled = F.interpolate(
                         batch_gpu,
                         size=(original_height, original_width),
@@ -1782,6 +1808,7 @@ def main(
     sharpen_radius: int = 6,
     sharpen_gain: float = 3.0,
     sharpen_min_contrast_frac: float = 0.15,
+    lowres_edge_fill_iters: int = 0,
     depth_only: bool = False,
     keep_depth_chunks: bool = False,
     guided_filter_radius: int = 0,
@@ -1858,6 +1885,7 @@ def main(
         "sharpen_radius": sharpen_radius,
         "sharpen_gain": sharpen_gain,
         "sharpen_min_contrast_frac": sharpen_min_contrast_frac,
+        "lowres_edge_fill_iters": lowres_edge_fill_iters,
         "guided_filter_radius": guided_filter_radius,
         "guided_filter_eps": guided_filter_eps,
     }
@@ -1902,6 +1930,7 @@ def main(
         sharpen_radius=sharpen_radius,
         sharpen_gain=sharpen_gain,
         sharpen_min_contrast_frac=sharpen_min_contrast_frac,
+        lowres_edge_fill_iters=lowres_edge_fill_iters,
     )
 
     if depth_only:
