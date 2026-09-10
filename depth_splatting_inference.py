@@ -1067,7 +1067,10 @@ class DepthCrafterDemo:
                     output_start, list(chunk_files), list(chunk_meta), global_min, global_max,
                 )
 
-                del frames, result, tensor_res
+                # (no tensor_res any more - the upsample-then-sharpen
+                # reorder merged the two passes into one loop, so there is
+                # no whole-chunk intermediate tensor left to free here.)
+                del frames, result
                 gc.collect()
                 torch.cuda.empty_cache()
 
