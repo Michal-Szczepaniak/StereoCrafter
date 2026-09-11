@@ -16,6 +16,22 @@
 # and stop), if telegram.env exists - see the block below.
 set -euo pipefail
 
+# ---- block auto-suspend/idle-suspend for as long as this timer runs (this
+# is a manual-work session, so there's no GPU load or other signal to tell
+# the desktop we're not idle). Re-execs itself once under systemd-inhibit,
+# which talks to systemd-logind over the SYSTEM bus (org.freedesktop.login1)
+# - unlike a desktop-specific session-bus inhibit call, this needs no
+# access to any particular user's session and works from any unprivileged
+# account, even one with no sudo/root relationship to whichever account the
+# desktop session is logged in as (verified). The lock is released
+# automatically the moment this re-exec'd process exits, whether cleanly,
+# via Ctrl+C, or killed - no manual trap/cookie bookkeeping needed. Silent
+# no-op (runs uninhibited) if systemd-inhibit isn't installed.
+if [[ -z "${_STEREOCRAFTER_INHIBITED:-}" ]] && command -v systemd-inhibit >/dev/null 2>&1; then
+    export _STEREOCRAFTER_INHIBITED=1
+    exec systemd-inhibit --what=sleep:idle --who="add_manual_time.sh" --why="Manual work session in progress" --mode=block "$0" "$@"
+fi
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_ROOT="${1:-"$REPO_DIR/outputs"}"
 mkdir -p "$OUTPUT_ROOT"

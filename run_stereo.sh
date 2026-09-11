@@ -18,6 +18,23 @@
 #   source presets/24GB.env && ./run_stereo.sh input.mp4
 set -euo pipefail
 
+# ---- block auto-suspend/idle-suspend for the whole pipeline run - a
+# rented-GPU or unattended run can sit between stages (retries, ffprobe,
+# etc.) long enough to look idle to the desktop even though it's still
+# working. Re-execs itself once under systemd-inhibit, which talks to
+# systemd-logind over the SYSTEM bus (org.freedesktop.login1) - unlike a
+# desktop-specific session-bus inhibit call, this needs no access to any
+# particular user's session and works from any unprivileged account, even
+# one with no sudo/root relationship to whichever account the desktop
+# session is logged in as (verified). The lock is released automatically
+# the moment this re-exec'd process exits, whether cleanly, via Ctrl+C, or
+# killed - no manual trap/cookie bookkeeping needed. Silent no-op (runs
+# uninhibited) if systemd-inhibit isn't installed.
+if [[ -z "${_STEREOCRAFTER_INHIBITED:-}" ]] && command -v systemd-inhibit >/dev/null 2>&1; then
+    export _STEREOCRAFTER_INHIBITED=1
+    exec systemd-inhibit --what=sleep:idle --who="run_stereo.sh" --why="Stereo pipeline running" --mode=block "$0" "$@"
+fi
+
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <input_video> [output_dir]" >&2
     exit 1
